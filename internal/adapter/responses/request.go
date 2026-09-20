@@ -245,8 +245,13 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 	req.Instructions = instr.String()
 
 	for _, t := range src.Tools {
-		if eErr := shared.FunctionTool(t.Type, EndpointPath); eErr != nil {
-			return nil, eErr
+		if t.Type != "function" {
+			// Skip client-side-only tool types (e.g. Codex "namespace"
+			// tools driving sub-agents/MCP): they have no upstream
+			// equivalent, so rejecting them would fail every request
+			// that declares them. Function tools still translate
+			// (FR-005 omission policy).
+			continue
 		}
 		req.Tools = append(req.Tools, shared.RespTool{
 			Type:        "function",

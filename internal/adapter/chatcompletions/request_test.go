@@ -36,6 +36,23 @@ func TestAuthHeaders(t *testing.T) {
 	}
 }
 
+func TestBuildRequest_ResponsesSkipsNamespaceTools(t *testing.T) {
+	body := `{"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}],"tools":[{"type":"function","name":"shell","description":"run","parameters":{"type":"object"}},{"type":"namespace","name":"subagents","tools":[]}]}`
+	m := mustBuild(t, "openai-response", body, nil)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", m["tools"])
+	}
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "shell" {
+		t.Errorf("function tool = %v", tools[0])
+	}
+	msgs := m["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("typeless message dropped: %v", m["messages"])
+	}
+}
+
 func TestBuildRequestUnsupportedFormat(t *testing.T) {
 	_, eErr := BuildRequest("m", "grpc", []byte(`{}`), nil)
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
@@ -684,10 +701,13 @@ func TestBuildRequestResponsesErrors(t *testing.T) {
 			}
 		})
 	}
-	// A non-function tool type is unsupported_protocol_or_parameter (FR-009).
-	_, eErr := BuildRequest("m", "openai-response", []byte(`{"tools":[{"type":"web_search"}]}`), nil)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("unsupported tool type: want ClassUnsupported, got %+v", eErr)
+	// A non-function tool type is skipped: client-side-only tools (e.g.
+	// Codex "namespace" tools) have no upstream equivalent, so dropping
+	// them keeps the request alive (FR-005 omission policy). A request
+	// carrying only such tools translates with no tools attached.
+	m := mustBuild(t, "openai-response", `{"input":"hi","tools":[{"type":"web_search"}]}`, nil)
+	if _, ok := m["tools"]; ok {
+		t.Fatalf("non-function tools not skipped: %v", m["tools"])
 	}
 }
 

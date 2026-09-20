@@ -360,10 +360,13 @@ func TestChatCompletionsErrors(t *testing.T) {
 			t.Errorf("%s: want ClassUnsupported, got %+v", c.name, eErr)
 		}
 	}
-	// A non-function tool type is unsupported_protocol_or_parameter (FR-009).
-	_, eErr := chatReq(t, `{"tools":[{"type":"web_search"}],"messages":[]}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Errorf("unknown tool type: want ClassUnsupported, got %+v", eErr)
+	// A non-function tool type is skipped (FR-005 omission policy).
+	m, eErr := chatReq(t, `{"tools":[{"type":"web_search"}],"messages":[]}`)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	if _, ok := m["tools"]; ok {
+		t.Errorf("non-function tools not skipped: %v", m["tools"])
 	}
 }
 
@@ -375,6 +378,20 @@ func TestChatCompletionsEmptyContentDropped(t *testing.T) {
 	msgs := m["messages"].([]any)
 	if len(msgs) != 1 || msgs[0].(map[string]any)["content"] != "hi" {
 		t.Errorf("messages = %v", msgs)
+	}
+}
+
+func TestResponsesSkipsNamespaceTools(t *testing.T) {
+	m, eErr := respReq(t, `{"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"namespace","name":"subagents"}]}`)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", m["tools"])
+	}
+	if tools[0].(map[string]any)["name"] != "shell" {
+		t.Errorf("function tool = %v", tools[0])
 	}
 }
 
@@ -557,10 +574,13 @@ func TestResponsesErrors(t *testing.T) {
 			t.Errorf("%s: want ClassUnsupported, got %+v", c.name, eErr)
 		}
 	}
-	// A non-function tool type is unsupported_protocol_or_parameter (FR-009).
-	_, eErr := respReq(t, `{"tools":[{"type":"web_search"}],"input":[]}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Errorf("non-function tool: want ClassUnsupported, got %+v", eErr)
+	// A non-function tool type is skipped (FR-005 omission policy).
+	m, eErr := respReq(t, `{"tools":[{"type":"web_search"}],"input":[]}`)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	if _, ok := m["tools"]; ok {
+		t.Errorf("non-function tools not skipped: %v", m["tools"])
 	}
 }
 

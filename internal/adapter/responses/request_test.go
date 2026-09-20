@@ -291,13 +291,27 @@ func TestFromChatCompletionsErrors(t *testing.T) {
 		{"unsupported part type", `{"messages":[{"role":"user","content":[{"type":"audio"}]}]}`, errclass.ClassUnsupported},
 		{"image missing url", `{"messages":[{"role":"user","content":[{"type":"image_url"}]}]}`, errclass.ClassTranslation},
 		{"unsupported role", `{"messages":[{"role":"function","content":"x"}]}`, errclass.ClassUnsupported},
-		{"unsupported tool type", `{"messages":[],"tools":[{"type":"code_interpreter"}]}`, errclass.ClassUnsupported},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			_, eErr := BuildRequest("m", "openai", []byte(tc.body), nil)
 			wantErr(t, eErr, tc.class)
 		})
+	}
+}
+
+func TestFromChatCompletionsSkipsNonFunctionTools(t *testing.T) {
+	out, eErr := BuildRequest("m", "openai", []byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","function":{"name":"f"}},{"type":"code_interpreter"}]}`), nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(out, &m); err != nil {
+		t.Fatalf("output is not JSON: %v", err)
+	}
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %v", m["tools"])
 	}
 }
 

@@ -484,23 +484,24 @@ func TestStreamConverterResponses(t *testing.T) {
 	sc := NewStreamConverter("openai-response")
 	var evs []sseEvt
 
-	// The role chunk primes id/model and announces response.created (F18).
+	// The role chunk primes id/model and announces response.created (F18),
+	// followed by response.in_progress (canonical lifecycle).
 	evs = feedAll(t, sc, `data: {"id":"r1","model":"m","choices":[{"index":0,"delta":{"role":"assistant"}}]}`)
-	if len(evs) != 1 || evs[0].Name != "response.created" {
-		t.Fatalf("first chunk must announce response.created: %v", evs)
+	if len(evs) != 2 || evs[0].Name != "response.created" || evs[1].Name != "response.in_progress" {
+		t.Fatalf("first chunk must announce response.created + in_progress: %v", evs)
 	}
 	if resp := evs[0].Data["response"].(map[string]any); resp["id"] != "r1" || resp["status"] != "in_progress" {
 		t.Fatalf("created payload wrong: %v", resp)
 	}
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{"content":"He"}}]}`)
-	if len(evs) != 2 || evs[0].Name != "response.output_item.added" || evs[1].Name != "response.output_text.delta" {
-		t.Fatalf("text chunk must announce the message item first: %v", evs)
+	if len(evs) != 3 || evs[0].Name != "response.output_item.added" || evs[1].Name != "response.content_part.added" || evs[2].Name != "response.output_text.delta" {
+		t.Fatalf("text chunk must announce the message item + part first: %v", evs)
 	}
 	item := evs[0].Data["item"].(map[string]any)
 	if item["type"] != "message" || item["role"] != "assistant" || evs[0].Data["output_index"] != float64(0) {
 		t.Fatalf("message item wrong: %v", evs[0])
 	}
-	td := evs[1].Data
+	td := evs[2].Data
 	if td["item_id"] != "r1" || td["output_index"] != float64(0) || td["delta"] != "He" {
 		t.Fatalf("output_text delta wrong: %v", evs[1])
 	}
@@ -537,10 +538,39 @@ func TestStreamConverterResponses(t *testing.T) {
 		t.Fatalf("response.completed must be deferred past finish_reason: %v", evs)
 	}
 	evs = feedAll(t, sc, `data: {"choices":[{"delta":{},"finish_reason":"length"}]}`)
-	if len(evs) != 1 || evs[0].Name != "response.completed" {
-		t.Fatalf("completed event wrong: %v", evs)
+	// Terminal closes every announced item in announcement order before
+	// response.completed so Responses clients can materialize text and
+	// tool calls from output_item.done: text.done, content_part.done,
+	// message item.done, then func args.done + item.done, then completed.
+	wantNames := []string{
+		"response.output_text.done", "response.content_part.done", "response.output_item.done",
+		"response.function_call_arguments.done", "response.output_item.done",
+		"response.completed",
 	}
-	resp := evs[0].Data["response"].(map[string]any)
+	if len(evs) != len(wantNames) {
+		t.Fatalf("terminal events wrong: %v", evs)
+	}
+	for i, want := range wantNames {
+		if evs[i].Name != want {
+			t.Fatalf("terminal event %d = %s, want %s (%v)", i, evs[i].Name, want, evs)
+		}
+	}
+	msgDone := evs[2].Data["item"].(map[string]any)
+	if msgDone["type"] != "message" || msgDone["role"] != "assistant" {
+		t.Fatalf("message done item wrong: %v", evs[4])
+	}
+	content, _ := json.Marshal(msgDone["content"])
+	if !strings.Contains(string(content), "He") {
+		t.Fatalf("message done must carry complete text: %v", evs[4])
+	}
+	fnDone := evs[4].Data["item"].(map[string]any)
+	if fnDone["type"] != "function_call" || fnDone["call_id"] != "c1" || fnDone["name"] != "f" {
+		t.Fatalf("function done item wrong: %v", evs[1])
+	}
+	if fnDone["arguments"] != `{"j":2}` {
+		t.Fatalf("function done must carry complete arguments: %v", evs[1])
+	}
+	resp := evs[5].Data["response"].(map[string]any)
 	if resp["id"] != "r1" || resp["object"] != "response" || resp["status"] != "completed" {
 		t.Fatalf("completed response wrong: %v", resp)
 	}
@@ -944,10 +974,19 @@ func TestStreamConverterFlushAfterFinishWithoutDONE(t *testing.T) {
 			`data: {"id":"r2","choices":[{"delta":{"role":"assistant","content":"x"}}]}`,
 			`data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":4}}`)
 		flushed := parseEvents(t, sc.Flush())
-		if len(flushed) != 1 || flushed[0].Name != "response.completed" {
+		wantNames := []string{
+			"response.output_text.done", "response.content_part.done",
+			"response.output_item.done", "response.completed",
+		}
+		if len(flushed) != len(wantNames) {
 			t.Fatalf("flush = %v", flushed)
 		}
-		resp := flushed[0].Data["response"].(map[string]any)
+		for i, want := range wantNames {
+			if flushed[i].Name != want {
+				t.Fatalf("flush event %d = %s, want %s (%v)", i, flushed[i].Name, want, flushed)
+			}
+		}
+		resp := flushed[3].Data["response"].(map[string]any)
 		u := resp["usage"].(map[string]any)
 		if u["input_tokens"] != float64(3) || u["output_tokens"] != float64(4) {
 			t.Fatalf("flushed completed usage wrong: %v", resp)

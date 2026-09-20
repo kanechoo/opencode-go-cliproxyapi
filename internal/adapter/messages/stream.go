@@ -253,6 +253,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 		// Lifecycle parity with the Chat Completions route's synthesizer:
 		// announce the response before any deltas reference it (F18).
 		*events = append(*events, sc.responsesEm().Created())
+		*events = append(*events, sc.responsesEm().InProgress())
 	case "content_block_start":
 		bs := &blockState{kind: ev.ContentBlock.Type, id: ev.ContentBlock.ID, name: ev.ContentBlock.Name}
 		sc.blocks[int(ev.Index)] = bs
@@ -273,6 +274,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 			*events = append(*events, sc.responsesEm().ItemAdded(sc.msgIdx, map[string]any{
 				"type": "message", "id": sc.msgID, "role": "assistant", "content": []any{},
 			}))
+			*events = append(*events, sc.responsesEm().ContentPartAdded(sc.msgID, sc.msgIdx))
 		case "tool_use":
 			sc.toolsSeen = true
 			bs.outIdx = sc.outCount
@@ -314,7 +316,7 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 		sc.captureCache(ev.Usage)
 		sc.stopReason = ev.Delta.StopReason
 	case "message_stop":
-		*events = append(*events, sc.responsesCompleted())
+		*events = append(*events, sc.responsesCompleted()...)
 		return true, nil
 	case "error":
 		return false, sseError(ev.Error)
@@ -330,11 +332,70 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 // represented by their function_call output items and never override the
 // status (FR-006). Shared by message_stop and Flush so an early upstream
 // close cannot diverge from the normal-path shape.
-func (sc *StreamConverter) responsesCompleted() []byte {
+func (sc *StreamConverter) responsesCompleted() [][]byte {
 	status := shared.ResponseStatusFromClaudeStop(sc.stopReason)
 	usage := shared.NewResponsesUsageFrom(sc.promptTokens+valueOrZero(sc.cacheRead)+valueOrZero(sc.cacheCreation), sc.completionTokens,
 		shared.UsageDetails{CachedTokens: sc.cacheRead, CacheWriteTokens: sc.cacheCreation})
-	return sc.responsesEm().Completed(status, usage, sc.outputItems())
+	out := sc.responsesDoneEvents()
+	return append(out, sc.responsesEm().Completed(status, usage, sc.outputItems()))
+}
+
+// responsesDoneEvents closes every announced item before the terminal
+// completed event, in the same order outputItems() renders: Responses
+// clients materialize assistant text and tool calls from
+// output_item.done payloads, never from deltas alone, so omitting these
+// drops the agent message client-side while usage still lands.
+func (sc *StreamConverter) responsesDoneEvents() [][]byte {
+	indexes := make([]int, 0, len(sc.blocks))
+	for i := range sc.blocks {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+	em := sc.responsesEm()
+	var text strings.Builder
+	firstText := -1
+	for _, i := range indexes {
+		if sc.blocks[i].kind == "text" {
+			firstText = i
+			break
+		}
+	}
+	var out [][]byte
+	toolDone := func(bs *blockState) {
+		args := shared.DefaultArgs(bs.args.String())
+		out = append(out, em.ArgsDone(bs.id, bs.outIdx, args))
+		out = append(out, em.ItemDone(bs.outIdx, shared.FunctionCallItem(bs.id, bs.name, args)))
+	}
+	for _, i := range indexes {
+		bs := sc.blocks[i]
+		if firstText >= 0 && i > firstText {
+			break
+		}
+		if bs.kind == "tool_use" {
+			toolDone(bs)
+		}
+	}
+	if firstText >= 0 && sc.msgIdx >= 0 {
+		for _, i := range indexes {
+			if bs := sc.blocks[i]; bs.kind == "text" {
+				text.WriteString(bs.text.String())
+			}
+		}
+		t := text.String()
+		out = append(out, em.TextDone(sc.msgID, sc.msgIdx, t))
+		out = append(out, em.ContentPartDone(sc.msgID, sc.msgIdx, t))
+		out = append(out, em.ItemDone(sc.msgIdx, shared.MessageItem(sc.msgID, t)))
+	}
+	if firstText >= 0 {
+		for _, i := range indexes {
+			if i > firstText {
+				if bs := sc.blocks[i]; bs.kind == "tool_use" {
+					toolDone(bs)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // responsesEm binds the shared Responses emitter kernel to the captured
@@ -360,7 +421,7 @@ func (sc *StreamConverter) Flush() [][]byte {
 	}
 	switch sc.sourceFormat {
 	case "openai-response":
-		return [][]byte{sc.responsesCompleted()}
+		return sc.responsesCompleted()
 	case "openai":
 		return nil
 	default: // claude passthrough forwards verbatim; nothing deferred

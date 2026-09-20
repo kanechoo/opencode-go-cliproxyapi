@@ -122,16 +122,20 @@ func TestResponsesSynthesisRouteParity(t *testing.T) {
 		t.Fatalf("routes diverge:\nclaude-source: %s\ncc-source:     %s", a, b)
 	}
 	for _, want := range []string{
-		`response.created`, `response.output_item.added`, `response.output_text.delta`,
-		`response.function_call_arguments.delta`, `"model":"m1"`, `"status":"completed"`,
-		`"total_tokens":5`,
+		`response.created`, `response.in_progress`, `response.output_item.added`,
+		`response.content_part.added`, `response.output_text.delta`,
+		`response.function_call_arguments.delta`, `response.function_call_arguments.done`,
+		`response.output_text.done`, `response.content_part.done`, `response.output_item.done`,
+		`"model":"m1"`, `"status":"completed"`, `"total_tokens":5`,
 	} {
 		if !strings.Contains(a, want) {
 			t.Errorf("synthesized stream missing %s", want)
 		}
 	}
-	if strings.Count(a, "data: ") != 7 {
-		t.Errorf("event count = %d, want 7 (created, 2 added, text delta, 2 args deltas, completed)",
-			strings.Count(a, "data: "))
+	// created, in_progress, 2 added, part added, text delta, 2 args deltas,
+	// args done, func item done, text done, part done, message item done,
+	// completed.
+	if strings.Count(a, "data: ") != 14 {
+		t.Errorf("event count = %d, want 14", strings.Count(a, "data: "))
 	}
 }

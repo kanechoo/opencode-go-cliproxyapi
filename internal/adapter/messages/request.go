@@ -287,8 +287,13 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 	req.Messages = b.msgs
 
 	for _, t := range src.Tools {
-		if eErr := shared.FunctionTool(t.Type, EndpointPath); eErr != nil {
-			return nil, eErr
+		if t.Type != "function" {
+			// Skip client-side-only tool types (e.g. Codex "namespace"
+			// tools driving sub-agents/MCP): they have no upstream
+			// equivalent, so rejecting them would fail every request
+			// that declares them. Function tools still translate
+			// (FR-005 omission policy).
+			continue
 		}
 		req.Tools = append(req.Tools, anthropicTool{
 			Name: t.Function.Name, Description: t.Function.Description,
@@ -405,8 +410,13 @@ func fromResponses(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupp
 	req.Messages = b.msgs
 
 	for _, t := range src.Tools {
-		if eErr := shared.FunctionTool(t.Type, EndpointPath); eErr != nil {
-			return nil, eErr
+		if t.Type != "function" {
+			// Skip client-side-only tool types (e.g. Codex "namespace"
+			// tools driving sub-agents/MCP): they have no upstream
+			// equivalent, so rejecting them would fail every request
+			// that declares them. Function tools still translate
+			// (FR-005 omission policy).
+			continue
 		}
 		schema := shared.ObjectSchema(t.Parameters)
 		req.Tools = append(req.Tools, anthropicTool{

@@ -666,6 +666,74 @@ func (e ResponsesEventEmitter) ArgsDelta(itemID string, outputIndex int, delta s
 	})
 }
 
+// InProgress marks the response as actively streaming after Created; the
+// codex client tolerates its absence, but native parity keeps other
+// Responses consumers on the canonical lifecycle.
+func (e ResponsesEventEmitter) InProgress() []byte {
+	return SSEEvent("response.in_progress", map[string]any{
+		"type": "response.in_progress",
+		"response": map[string]any{
+			"id": e.ID, "object": "response", "status": "in_progress",
+		},
+	})
+}
+
+// ContentPartAdded opens the output_text part of an announced message item
+// before its first text delta (canonical native lifecycle).
+func (e ResponsesEventEmitter) ContentPartAdded(itemID string, outputIndex int) []byte {
+	return SSEEvent("response.content_part.added", map[string]any{
+		"type": "response.content_part.added", "item_id": itemID, "output_index": outputIndex,
+		"part": map[string]any{"type": "output_text", "text": "", "annotations": []any{}},
+	})
+}
+
+// TextDone closes the output_text part with the complete text.
+func (e ResponsesEventEmitter) TextDone(itemID string, outputIndex int, text string) []byte {
+	return SSEEvent("response.output_text.done", map[string]any{
+		"type": "response.output_text.done", "item_id": itemID, "output_index": outputIndex, "text": text,
+	})
+}
+
+// ContentPartDone closes the content part with the complete text.
+func (e ResponsesEventEmitter) ContentPartDone(itemID string, outputIndex int, text string) []byte {
+	return SSEEvent("response.content_part.done", map[string]any{
+		"type": "response.content_part.done", "item_id": itemID, "output_index": outputIndex,
+		"part": map[string]any{"type": "output_text", "text": text, "annotations": []any{}},
+	})
+}
+
+// ArgsDone closes a function_call item with its complete arguments JSON.
+func (e ResponsesEventEmitter) ArgsDone(itemID string, outputIndex int, args string) []byte {
+	return SSEEvent("response.function_call_arguments.done", map[string]any{
+		"type": "response.function_call_arguments.done", "item_id": itemID, "output_index": outputIndex, "arguments": args,
+	})
+}
+
+// ItemDone finalizes one announced output item carrying its complete
+// payload. Responses clients (notably codex) materialize assistant text
+// and tool calls ONLY from this event — deltas alone never produce an
+// agent message — so every announced item must be closed before the
+// terminal completed event.
+func (e ResponsesEventEmitter) ItemDone(outputIndex int, item RespItem) []byte {
+	return SSEEvent("response.output_item.done", map[string]any{
+		"type": "response.output_item.done", "output_index": outputIndex, "item": item,
+	})
+}
+
+// MessageItem builds the canonical assistant message RespItem carrying
+// the complete text; shared by every synthesis site so done payloads
+// cannot diverge from terminal output items.
+func MessageItem(id, text string) RespItem {
+	content, _ := json.Marshal([]outputTextPart{{Type: "output_text", Text: text}})
+	return RespItem{Type: "message", ID: id, Role: "assistant", Content: content}
+}
+
+// FunctionCallItem builds the canonical function_call RespItem with
+// complete arguments JSON.
+func FunctionCallItem(callID, name, args string) RespItem {
+	return RespItem{Type: "function_call", CallID: callID, Name: name, Arguments: args}
+}
+
 // Completed renders the terminal response.completed event: status from the
 // route's status mapping, usage always attached (F-R6), and output items
 // rendered by the caller through OutputAssembler.
@@ -915,9 +983,13 @@ func (r *ResponsesRequest) DecodeInstructions() (string, *errclass.Error) {
 // user-message item carrying the raw string bytes — each builder's
 // message pipeline renders it exactly as its former inline string branch
 // did, including dropping the empty string — and absent or null decodes
-// to zero items. Any other shape is a translation failure. One kernel owns
-// the string-or-items discrimination for both Responses-source builders so
-// it cannot diverge again.
+// to zero items. Any other shape is a translation failure. Array items
+// carrying a role but no explicit type normalize to "message", matching
+// the Responses wire rule that message items are identifiable by role
+// alone (Codex and other clients omit the redundant type). Items with
+// neither type nor role keep the empty type so builders still reject them
+// descriptively. One kernel owns the string-or-items discrimination for
+// both Responses-source builders so it cannot diverge again.
 func (r *ResponsesRequest) DecodeInputItems() ([]RespItem, *errclass.Error) {
 	if !HasContent(r.Input) {
 		return nil, nil
@@ -929,6 +1001,11 @@ func (r *ResponsesRequest) DecodeInputItems() ([]RespItem, *errclass.Error) {
 	var items []RespItem
 	if err := json.Unmarshal(r.Input, &items); err != nil {
 		return nil, errclass.Translation("input must be a string or an array of items: " + err.Error())
+	}
+	for i := range items {
+		if items[i].Type == "" && items[i].Role != "" {
+			items[i].Type = "message"
+		}
 	}
 	return items, nil
 }
@@ -1458,19 +1535,4 @@ func (a *OutputAssembler) Render() []any {
 		}
 	}
 	return a.items
-}
-
-// FunctionTool validates one tool definition for translation. toolType
-// must be "function" — anything else is unsupported_protocol_or_parameter
-// (FR-009: a non-function tool type is an unsupported parameter) naming
-// the target endpoint. Callers normalize or preserve the parameter schema
-// themselves from their own raw field.
-func FunctionTool(toolType, targetLabel string) *errclass.Error {
-	if toolType != "function" {
-		return &errclass.Error{
-			Class:   errclass.ClassUnsupported,
-			Message: fmt.Sprintf("unsupported tool type %q; only function tools translate to %s", toolType, targetLabel),
-		}
-	}
-	return nil
 }

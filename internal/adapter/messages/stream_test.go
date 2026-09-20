@@ -787,3 +787,50 @@ func TestStreamResponsesTextAggregationMatchesNonStream(t *testing.T) {
 		t.Errorf("aggregated message item wrong: %v", msgItem)
 	}
 }
+
+// Regression pin: every announced Responses item must be closed with
+// response.output_item.done before response.completed — Responses clients
+// (notably codex) materialize assistant text and tool calls ONLY from
+// done payloads, so deltas alone leave the turn with usage but no agent
+// message.
+func TestStreamResponsesDoneLifecycle(t *testing.T) {
+	sc := NewStreamConverter("openai-response")
+	events, done, eErr := feed(t, sc,
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_d\",\"model\":\"m\",\"usage\":{\"input_tokens\":3}}}\n\n",
+		"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
+		"event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c9\",\"name\":\"f\"}}\n\n",
+		"event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n",
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	if eErr != nil || !done {
+		t.Fatalf("done=%v err=%v", done, eErr)
+	}
+	var names []string
+	for _, raw := range events {
+		line, _, _ := strings.Cut(string(raw), "\n")
+		names = append(names, strings.TrimPrefix(line, "event: "))
+	}
+	want := []string{
+		"response.created", "response.in_progress",
+		"response.output_item.added", "response.content_part.added", "response.output_text.delta",
+		"response.output_item.added", "response.function_call_arguments.delta",
+		"response.output_text.done", "response.content_part.done", "response.output_item.done",
+		"response.function_call_arguments.done", "response.output_item.done",
+		"response.completed",
+	}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Fatalf("event sequence = %v, want %v", names, want)
+	}
+	byName := namedEvents(t, events)
+	msgDone := byName["response.output_item.done"][0]["item"].(map[string]any)
+	content, _ := json.Marshal(msgDone["content"])
+	if msgDone["type"] != "message" || !strings.Contains(string(content), "OK") {
+		t.Fatalf("message done must carry complete text: %v", msgDone)
+	}
+	fnDone := byName["response.output_item.done"][1]["item"].(map[string]any)
+	if fnDone["type"] != "function_call" || fnDone["call_id"] != "c9" || fnDone["arguments"] != `{"a":1}` {
+		t.Fatalf("function done must carry complete arguments: %v", fnDone)
+	}
+}

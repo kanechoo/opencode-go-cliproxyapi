@@ -439,6 +439,7 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 		// Lifecycle parity with the Responses protocol: announce the
 		// response before any deltas reference it (F18).
 		events = append(events, sc.responsesEm().Created())
+		events = append(events, sc.responsesEm().InProgress())
 	}
 	if len(chunk.Choices) == 0 {
 		return events, nil
@@ -451,6 +452,7 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 			events = append(events, sc.responsesEm().ItemAdded(sc.msgIndex, map[string]any{
 				"type": "message", "role": "assistant", "id": sc.id, "content": []any{},
 			}))
+			events = append(events, sc.responsesEm().ContentPartAdded(sc.id, sc.msgIndex))
 		}
 		sc.respText.WriteString(choice.Delta.Content)
 		events = append(events, sc.responsesEm().TextDelta(sc.id, sc.msgIndex, choice.Delta.Content))
@@ -509,20 +511,38 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	// tools-first announcements), never displacing already-announced
 	// function_call items; this mirrors the Messages-route invariant that
 	// terminal output order equals announcement order (W4 pin).
+	em := sc.responsesEm()
+	text := sc.respText.String()
+	hasText := sc.msgIndex >= 0
+	// Close every announced item before the terminal completed event:
+	// Responses clients materialize assistant text and tool calls from
+	// output_item.done payloads, never from deltas alone, so omitting
+	// these drops the agent message client-side while usage still lands.
+	var out [][]byte
+	msgDones := func() {
+		out = append(out, em.TextDone(sc.id, sc.msgIndex, text))
+		out = append(out, em.ContentPartDone(sc.id, sc.msgIndex, text))
+		out = append(out, em.ItemDone(sc.msgIndex, shared.MessageItem(sc.id, text)))
+	}
 	oa := shared.NewOutputAssembler(sc.id)
 	reserved := false
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
-		if sc.msgIndex >= 0 && !reserved && t.blockIndex > sc.msgIndex {
+		if hasText && !reserved && t.blockIndex > sc.msgIndex {
 			oa.ReserveTextSlot()
+			msgDones()
 			reserved = true
 		}
-		oa.AppendFunctionCall(t.id, t.name, shared.DefaultArgs(t.args.String()))
+		args := shared.DefaultArgs(t.args.String())
+		out = append(out, em.ArgsDone(t.id, t.blockIndex, args))
+		out = append(out, em.ItemDone(t.blockIndex, shared.FunctionCallItem(t.id, t.name, args)))
+		oa.AppendFunctionCall(t.id, t.name, args)
 	}
-	if sc.msgIndex >= 0 && !reserved {
+	if hasText && !reserved {
 		oa.ReserveTextSlot()
+		msgDones()
 	}
-	oa.AddText(sc.respText.String())
+	oa.AddText(text)
 	// Always attach (F-R6): zero-valued fields when upstream sent none.
 	input, outputTokens := int64(0), int64(0)
 	if sc.usage != nil {
@@ -539,5 +559,6 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 		}
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
-	return [][]byte{sc.responsesEm().Completed(status, usage, oa.Render())}
+	out = append(out, em.Completed(status, usage, oa.Render()))
+	return out
 }

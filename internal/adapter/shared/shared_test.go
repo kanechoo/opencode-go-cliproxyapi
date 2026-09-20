@@ -367,19 +367,6 @@ func TestOpenAIImageURL(t *testing.T) {
 	}
 }
 
-func TestFunctionTool(t *testing.T) {
-	if eErr := FunctionTool("function", "/v1/responses"); eErr != nil {
-		t.Fatalf("valid tool: %v", eErr)
-	}
-
-	eErr := FunctionTool("web_search", "/v1/chat/completions")
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"web_search"`) ||
-		!strings.Contains(eErr.Message, "/v1/chat/completions") {
-		t.Fatalf("rejection = %v", eErr)
-	}
-}
-
 func TestUnsupportedFormat(t *testing.T) {
 	eErr := UnsupportedFormat("grpc", "/v1/responses")
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
@@ -1306,6 +1293,36 @@ func TestResponsesRequestDecodeHelpers(t *testing.T) {
 	items, eErr = arrIn.DecodeInputItems()
 	if eErr != nil || len(items) != 1 || items[0].Type != "function_call" || items[0].CallID != "c" {
 		t.Errorf("array input = %+v, %v", items, eErr)
+	}
+
+	var typeless ResponsesRequest
+	if err := json.Unmarshal([]byte(
+		`{"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`), &typeless); err != nil {
+		t.Fatal(err)
+	}
+	items, eErr = typeless.DecodeInputItems()
+	if eErr != nil || len(items) != 1 || items[0].Type != "message" || items[0].Role != "user" {
+		t.Errorf("typeless message input = %+v, %v", items, eErr)
+	}
+
+	var typelessAssistant ResponsesRequest
+	if err := json.Unmarshal([]byte(
+		`{"input":[{"role":"assistant","content":"done"}]}`), &typelessAssistant); err != nil {
+		t.Fatal(err)
+	}
+	if items, eErr := typelessAssistant.DecodeInputItems(); eErr != nil || len(items) != 1 ||
+		items[0].Type != "message" || items[0].Role != "assistant" {
+		t.Errorf("typeless assistant input = %+v, %v", items, eErr)
+	}
+
+	var anonymous ResponsesRequest
+	if err := json.Unmarshal([]byte(
+		`{"input":[{"content":"hi"}]}`), &anonymous); err != nil {
+		t.Fatal(err)
+	}
+	if items, eErr := anonymous.DecodeInputItems(); eErr != nil || len(items) != 1 ||
+		items[0].Type != "" {
+		t.Errorf("roleless input = %+v, %v", items, eErr)
 	}
 
 	var badInstr ResponsesRequest
