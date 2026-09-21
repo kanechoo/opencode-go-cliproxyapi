@@ -56,7 +56,7 @@ type messagesRequest struct {
 func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
 	switch sourceFormat {
 	case "claude":
-		return shared.RewriteModelID(upstreamModel, sourceBody, "claude")
+		return fromClaude(upstreamModel, sourceBody)
 	case "openai":
 		return fromChatCompletions(upstreamModel, sourceBody, ts)
 	case "openai-response":
@@ -64,6 +64,129 @@ func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, 
 	default:
 		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
 	}
+}
+
+// fromClaude normalizes an inbound Anthropic Messages body for the
+// upstream endpoint. Claude Code 2.x emits system reminders as
+// role:"system" messages inside the array, which the Messages contract
+// (user/assistant only) and Anthropic-compatible upstreams reject —
+// surfacing downstream as a misleading auth-fallback error. Fold them
+// into the top-level system field (same semantics as system/developer
+// roles in fromChatCompletions); every other field passes through
+// untouched via the shared model-ID rewrite.
+func fromClaude(upstreamModel string, body []byte) ([]byte, *errclass.Error) {
+	var req map[string]json.RawMessage
+	if err := json.Unmarshal(body, &req); err != nil {
+		return nil, errclass.Translation("malformed claude request JSON: " + err.Error())
+	}
+	if req == nil {
+		return nil, errclass.Translation("malformed request body: JSON null is not a valid request")
+	}
+	rawMsgs, ok := req["messages"]
+	if !ok || !shared.HasContent(rawMsgs) {
+		return shared.RewriteModelID(upstreamModel, body, "claude")
+	}
+	var msgs []map[string]json.RawMessage
+	if err := json.Unmarshal(rawMsgs, &msgs); err != nil {
+		return nil, errclass.Translation("malformed claude messages: " + err.Error())
+	}
+	kept := make([]map[string]json.RawMessage, 0, len(msgs))
+	var sysTexts []string
+	seenSystem := false
+	for _, m := range msgs {
+		var role string
+		if r, ok := m["role"]; ok {
+			_ = json.Unmarshal(r, &role)
+		}
+		if role != "system" {
+			kept = append(kept, m)
+			continue
+		}
+		seenSystem = true
+		text, eErr := systemRoleText(m["content"])
+		if eErr != nil {
+			return nil, eErr
+		}
+		if text != "" {
+			sysTexts = append(sysTexts, text)
+		}
+	}
+	if !seenSystem {
+		return shared.RewriteModelID(upstreamModel, body, "claude")
+	}
+	// Merge collected texts into the top-level system field, preserving
+	// any existing system content and its shape (string stays string
+	// only when nothing is added — here something always is).
+	rawSys, hasSys := req["system"]
+	switch {
+	case !hasSys || !shared.HasContent(rawSys):
+		req["system"] = mustSystemJSON(sysTexts)
+	default:
+		var s string
+		if json.Unmarshal(rawSys, &s) == nil {
+			req["system"] = mustSystemJSON(append([]string{s}, sysTexts...))
+		} else {
+			var elems []json.RawMessage
+			if err := json.Unmarshal(rawSys, &elems); err != nil {
+				return nil, errclass.Translation("malformed claude system field: " + err.Error())
+			}
+			for _, t := range sysTexts {
+				b, _ := json.Marshal(textBlock(t)) // composed type; cannot fail
+				elems = append(elems, b)
+			}
+			b, _ := json.Marshal(elems) // composed types; cannot fail
+			req["system"] = b
+		}
+	}
+	keptRaw, _ := json.Marshal(kept) // composed types; cannot fail
+	req["messages"] = keptRaw
+	folded, _ := json.Marshal(req) // keys are RawMessages; cannot fail
+	return shared.RewriteModelID(upstreamModel, folded, "claude")
+}
+
+// mustSystemJSON renders system texts with the outbound shape policy:
+// one piece stays a plain string, several become text blocks.
+func mustSystemJSON(parts []string) json.RawMessage {
+	b, _ := json.Marshal(systemField(parts)) // composed types; cannot fail
+	return b
+}
+
+// systemRoleText extracts the usable text of a role:"system" message.
+// Text blocks concatenate; images are rejected by the shared kernel;
+// any other block kind fails descriptively — never silently dropped
+// (FR-005).
+func systemRoleText(raw json.RawMessage) (string, *errclass.Error) {
+	if !shared.HasContent(raw) {
+		return "", nil
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, nil
+	}
+	var elems []json.RawMessage
+	if err := json.Unmarshal(raw, &elems); err != nil {
+		return "", errclass.Translation("malformed claude system message content: " + err.Error())
+	}
+	var sb strings.Builder
+	for _, e := range elems {
+		var blk map[string]json.RawMessage
+		if err := json.Unmarshal(e, &blk); err != nil {
+			return "", errclass.Translation("malformed claude system message block: " + err.Error())
+		}
+		var typ string
+		_ = json.Unmarshal(blk["type"], &typ)
+		switch typ {
+		case "text":
+			var t string
+			_ = json.Unmarshal(blk["text"], &t)
+			sb.WriteString(t)
+		case "image":
+			return "", shared.SystemImageRejected()
+		default:
+			return "", errclass.Translation(fmt.Sprintf("system-role message carries unsupported %q block", typ))
+		}
+	}
+	return sb.String(), nil
 }
 
 // contentParts normalizes an OpenAI-style content field into Anthropic

@@ -61,6 +61,65 @@ func TestBuildRequestClaude(t *testing.T) {
 	}
 }
 
+func TestBuildRequestClaudeSystemRoleFolded(t *testing.T) {
+	body := []byte(`{"model":"opencode-go/deepseek-v4.1-flash","max_tokens":64,` +
+		`"system":"top","output_config":{"effort":"high"},` +
+		`"messages":[{"role":"user","content":"hi"},` +
+		`{"role":"system","content":[{"type":"text","text":"reminder"}]}],"stream":true}`)
+	out, eErr := BuildRequest("deepseek-v4.1-flash", "claude", body, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	msgs, _ := m["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message after fold, got %v", msgs)
+	}
+	if msgs[0].(map[string]any)["role"] != "user" {
+		t.Errorf("remaining message role = %v", msgs[0])
+	}
+	sys, _ := m["system"].([]any)
+	if len(sys) != 2 {
+		t.Fatalf("want 2 system blocks, got %v", m["system"])
+	}
+	if sys[0].(map[string]any)["text"] != "top" || sys[1].(map[string]any)["text"] != "reminder" {
+		t.Errorf("system blocks out of order: %v", sys)
+	}
+	// Unrelated claude-native fields must pass through untouched.
+	if m["stream"] != true {
+		t.Errorf("stream lost: %v", m["stream"])
+	}
+	oc, _ := m["output_config"].(map[string]any)
+	if oc["effort"] != "high" {
+		t.Errorf("output_config lost: %v", m["output_config"])
+	}
+}
+
+func TestBuildRequestClaudeSystemRoleStringContent(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":8,` +
+		`"messages":[{"role":"system","content":"s1"},{"role":"user","content":"hi"}]}`)
+	out, eErr := BuildRequest("m", "claude", body, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	if m["system"] != "s1" {
+		t.Errorf("single system text should stay a string, got %v", m["system"])
+	}
+	if msgs, _ := m["messages"].([]any); len(msgs) != 1 {
+		t.Errorf("want 1 message after fold, got %v", msgs)
+	}
+}
+
+func TestBuildRequestClaudeSystemRoleUnsupportedBlock(t *testing.T) {
+	body := []byte(`{"model":"m","max_tokens":8,` +
+		`"messages":[{"role":"system","content":[{"type":"tool_use","id":"t","name":"n","input":{}}]}]}`)
+	_, eErr := BuildRequest("m", "claude", body, nil)
+	if eErr == nil || eErr.Class != errclass.ClassTranslation {
+		t.Fatalf("want ClassTranslation, got %+v", eErr)
+	}
+}
+
 func TestBuildRequestClaudeMalformed(t *testing.T) {
 	_, eErr := BuildRequest("m", "claude", []byte(`{`), nil)
 	if eErr == nil || eErr.Class != errclass.ClassTranslation {
