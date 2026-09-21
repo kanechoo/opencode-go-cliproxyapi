@@ -185,6 +185,26 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 			if msg != nil {
 				out.Messages = append(out.Messages, *msg)
 			}
+		case "system":
+			// Claude Code 2.x system reminders arrive as role:"system"
+			// messages; Chat Completions natively supports the system
+			// role, so emit them directly (FR-005: map, never drop).
+			var sys strings.Builder
+			sys.WriteString(m.Content)
+			for i := range m.Blocks {
+				blk := &m.Blocks[i]
+				switch blk.Kind {
+				case "text":
+					sys.WriteString(blk.Text)
+				case "image":
+					return nil, shared.SystemImageRejected()
+				default:
+					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
+				}
+			}
+			if sys.Len() > 0 {
+				out.Messages = append(out.Messages, ccMessage{Role: "system", Content: sys.String()})
+			}
 		default:
 			return nil, shared.ValidateRole(m.Role, EndpointPath)
 		}

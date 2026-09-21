@@ -511,12 +511,19 @@ func TestFromClaudeMessagesAbsentSystemAndNullContent(t *testing.T) {
 // naming the endpoint, exactly like every other translator leg — never
 // forwarded verbatim upstream.
 func TestClaudeUnknownRoleRejected(t *testing.T) {
-	body := []byte(`{"max_tokens":10,"messages":[` +
-		`{"role":"user","content":"hi"},{"role":"system","content":"mid-history"}]}`)
-	_, eErr := BuildRequest("m", "claude", body, nil)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		eErr.Message != `unsupported message role "system" for /v1/responses` {
-		t.Fatalf("mid-history system = %+v", eErr)
+	// Mid-history system reminders fold into the instructions instead
+	// of failing (Claude Code 2.x emits them as role:"system").
+	out, eErr := BuildRequest("m", "claude", []byte(`{"max_tokens":10,"system":"base","messages":[`+
+		`{"role":"user","content":"hi"},{"role":"system","content":"mid-history"}]}`), nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	if m["instructions"] != "base\n\nmid-history" {
+		t.Fatalf("instructions = %v", m["instructions"])
+	}
+	if items := inputItems(t, m); len(items) != 1 {
+		t.Fatalf("want 1 input item, got %v", items)
 	}
 
 	_, eErr = BuildRequest("m", "claude",

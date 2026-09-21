@@ -329,6 +329,29 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 	req.Instructions = src.System
 
 	for _, m := range src.Messages {
+		if m.Role == "system" {
+			// Same fold as the chat-route twin: Claude Code 2.x system
+			// reminders join the instructions (FR-005: map, never drop).
+			var sys strings.Builder
+			sys.WriteString(m.Content)
+			for _, blk := range m.Blocks {
+				switch blk.Kind {
+				case "text":
+					sys.WriteString(blk.Text)
+				case "image":
+					return nil, shared.SystemImageRejected()
+				default:
+					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
+				}
+			}
+			if sys.Len() > 0 {
+				if req.Instructions != "" {
+					req.Instructions += "\n\n"
+				}
+				req.Instructions += sys.String()
+			}
+			continue
+		}
 		switch m.Role {
 		case "user", "assistant":
 		default:

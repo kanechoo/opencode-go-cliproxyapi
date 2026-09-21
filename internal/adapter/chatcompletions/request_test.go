@@ -524,6 +524,22 @@ func TestBuildRequestClaudeVariants(t *testing.T) {
 	})
 }
 
+func TestBuildRequestClaudeSystemRole(t *testing.T) {
+	// Claude Code 2.x system reminders arrive as role:"system" messages;
+	// the chat route emits them as native system messages (FR-005).
+	m := mustBuild(t, "claude",
+		`{"max_tokens":64,"messages":[{"role":"user","content":"hi"},`+
+			`{"role":"system","content":[{"type":"text","text":"reminder"}]}]}`, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages, got %v", msgs)
+	}
+	sys := msgs[1].(map[string]any)
+	if sys["role"] != "system" || sys["content"] != "reminder" {
+		t.Fatalf("system message wrong: %v", sys)
+	}
+}
+
 func TestBuildRequestResponses(t *testing.T) {
 	body := `{
 		"model":"x","max_output_tokens":99,"temperature":0.7,
