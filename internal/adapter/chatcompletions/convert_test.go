@@ -35,8 +35,8 @@ func TestConvertNonStreamStatusErrors(t *testing.T) {
 	}
 
 	// Long bodies are bounded to a redacted snippet, never echoed whole.
-	_, eErr := ConvertNonStreamResponse("claude", 500, []byte(`{"error":"`+strings.Repeat("y", 200)+`"}`))
-	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 83 {
+	_, eErr := ConvertNonStreamResponse("claude", 500, []byte(`{"error":"`+strings.Repeat("y", 600)+`"}`))
+	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 503 {
 		t.Fatalf("upstream body not bounded: %q", eErr.Message)
 	}
 }
@@ -106,6 +106,39 @@ func TestConvertNonStreamClaude(t *testing.T) {
 	if tu["type"] != "tool_use" || tu["id"] != "c1" || tu["name"] != "f" ||
 		fmt.Sprint(tu["input"]) != "map[k:1]" {
 		t.Fatalf("tool_use block wrong: %v", tu)
+	}
+}
+
+// reasoning_content becomes a leading thinking block so client history
+// keeps the reasoning thinking-mode upstreams require back on the next
+// turn (deepseek "must be passed back" 400).
+func TestConvertNonStreamClaudeReasoning(t *testing.T) {
+	body := `{"id":"r","model":"m","choices":[{"finish_reason":"stop","message":{"role":"assistant","content":"hi","reasoning_content":"because"}}],"usage":{"prompt_tokens":1,"completion_tokens":2}}`
+	m := mustConvert(t, "claude", body)
+	content := m["content"].([]any)
+	if len(content) != 2 {
+		t.Fatalf("want thinking + text blocks, got %v", content)
+	}
+	th := content[0].(map[string]any)
+	if th["type"] != "thinking" || th["thinking"] != "because" {
+		t.Fatalf("thinking block wrong: %v", th)
+	}
+	if content[1].(map[string]any)["text"] != "hi" {
+		t.Fatalf("text block wrong: %v", content[1])
+	}
+
+	// Absent or empty reasoning_content emits no thinking block.
+	for _, b := range []string{
+		`{"choices":[{"finish_reason":"stop","message":{"content":"hi"}}]}`,
+		`{"choices":[{"finish_reason":"stop","message":{"content":"hi","reasoning_content":""}}]}`,
+		`{"choices":[{"finish_reason":"stop","message":{"content":"hi","reasoning_content":[]}}]}`,
+	} {
+		m := mustConvert(t, "claude", b)
+		for _, blk := range m["content"].([]any) {
+			if blk.(map[string]any)["type"] == "thinking" {
+				t.Fatalf("phantom thinking block for %s", b)
+			}
+		}
 	}
 }
 
@@ -331,8 +364,10 @@ func TestConvertChatUsageDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 		u := m["usage"].(map[string]any)
+		// input_tokens is the upstream full count (cache included),
+		// with the cache breakdown alongside for clients to discount.
 		if format == "claude" {
-			if u["input_tokens"] != float64(2) || u["cache_read_input_tokens"] != float64(8) {
+			if u["input_tokens"] != float64(10) || u["cache_read_input_tokens"] != float64(8) {
 				t.Fatalf("claude usage = %v", u)
 			}
 		} else if u["input_tokens"] != float64(10) || u["input_tokens_details"].(map[string]any)["cached_tokens"] != float64(8) || u["output_tokens_details"].(map[string]any)["reasoning_tokens"] != float64(3) {

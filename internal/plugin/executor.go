@@ -381,8 +381,15 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		return classEnvelope(errclass.FromNetwork(err)), nil
 	}
 	if st >= 400 {
+		// The host registers the upstream stream before surfacing the
+		// status, so the error body is still readable here: drain it for
+		// classification. A status-only error degrades downstream to the
+		// host's opaque "plugin call failed" (empty envelope messages are
+		// replaced host-side), hiding the real upstream diagnostic — the
+		// same reason the non-stream path uses UpstreamStatusError.
+		body := m.drainStreamErrorBody(id)
 		_ = m.bridge.StreamClose(id)
-		return classEnvelope(errclass.FromStatus(st, "")), nil
+		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
 	}
 
 	downID := req.StreamID
@@ -396,6 +403,30 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 		m.pumpStream(downID, id, res, req.SourceFormat)
 	}()
 	return okEnvelope(struct{}{}), nil
+}
+
+// streamErrorBodyBound caps the pre-first-byte error drain: an upstream
+// 4xx body is a short JSON error object, never a stream payload.
+const streamErrorBodyBound = 4096
+
+// drainStreamErrorBody performs a single host stream_read on a stream whose
+// open already reported a 4xx+ status, returning whatever error body the
+// upstream delivered with it. Best-effort by design: StreamRead has no
+// request deadline (upstream-close semantics govern blocking), so any
+// transport failure, reported error label, or empty/oversized payload
+// degrades to nil — the caller then classifies on status alone, exactly
+// as before this drain existed. A single read is sufficient: hosts deliver
+// open-time failures as one terminal chunk (payload+done, or an error
+// label), and the stream is closed by the caller immediately after.
+func (m *Manager) drainStreamErrorBody(upstreamID string) []byte {
+	payload, readErrMsg, _, err := m.bridge.StreamRead(upstreamID)
+	if err != nil || readErrMsg != "" || len(payload) == 0 {
+		return nil
+	}
+	if len(payload) > streamErrorBodyBound {
+		payload = payload[:streamErrorBodyBound]
+	}
+	return payload
 }
 
 func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string) {

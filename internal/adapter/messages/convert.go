@@ -131,7 +131,11 @@ func claudeToChat(body []byte) ([]byte, *errclass.Error) {
 			"message":       msg,
 			"finish_reason": finish,
 		}},
-		shared.CCUsageFrom(resp.Usage.InputTokens+valueOrZero(resp.Usage.CacheRead)+valueOrZero(resp.Usage.CacheCreation), resp.Usage.OutputTokens, shared.UsageDetails{CachedTokens: resp.Usage.CacheRead}))
+		// Upstream input_tokens is already the full count (cache hits
+		// included, Anthropic semantics): pass through verbatim with the
+		// cache breakdown alongside, never add or subtract — clients
+		// compute discounts and context share from full+detail themselves.
+		shared.CCUsageFrom(resp.Usage.InputTokens, resp.Usage.OutputTokens, shared.UsageDetails{CachedTokens: resp.Usage.CacheRead}))
 	b, _ := json.Marshal(out) // composed marshallable types only; cannot fail
 	return b, nil
 }
@@ -173,7 +177,8 @@ func claudeToResponses(body []byte) ([]byte, *errclass.Error) {
 		Model:  resp.Model,
 		Status: status,
 		Output: []any{},
-		Usage:  shared.NewResponsesUsageFrom(resp.Usage.InputTokens+valueOrZero(resp.Usage.CacheRead)+valueOrZero(resp.Usage.CacheCreation), resp.Usage.OutputTokens, shared.UsageDetails{CachedTokens: resp.Usage.CacheRead, CacheWriteTokens: resp.Usage.CacheCreation}),
+		// Full-count passthrough, same policy as claudeToChat above.
+		Usage: shared.NewResponsesUsageFrom(resp.Usage.InputTokens, resp.Usage.OutputTokens, shared.UsageDetails{CachedTokens: resp.Usage.CacheRead, CacheWriteTokens: resp.Usage.CacheCreation}),
 	}
 	oa := shared.NewOutputAssembler(resp.ID)
 	for _, blk := range resp.Content {
@@ -198,11 +203,4 @@ func claudeToResponses(body []byte) ([]byte, *errclass.Error) {
 	out.Output = oa.Render()
 	b, _ := json.Marshal(out) // only marshallable composed types; cannot fail
 	return b, nil
-}
-
-func valueOrZero(v *int64) int64 {
-	if v != nil {
-		return *v
-	}
-	return 0
 }

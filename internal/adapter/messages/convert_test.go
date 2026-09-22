@@ -32,15 +32,15 @@ func TestConvertMessagesStatusErrors(t *testing.T) {
 	}
 
 	// Long bodies are bounded to a redacted snippet, never echoed whole.
-	_, eErr = ConvertNonStreamResponse("openai", 500, []byte(strings.Repeat("x", 200)))
-	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 83 {
+	_, eErr = ConvertNonStreamResponse("openai", 500, []byte(strings.Repeat("x", 600)))
+	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 503 {
 		t.Fatalf("upstream body not bounded: %q", eErr.Message)
 	}
 
 	// Redaction work is bounded: bodies beyond 4096 bytes are truncated
 	// before snippet extraction, so the message stays snippet-sized.
 	_, eErr = ConvertNonStreamResponse("openai", 500, []byte(strings.Repeat("x", 1<<20)))
-	if eErr == nil || len(eErr.Message) > 83 {
+	if eErr == nil || len(eErr.Message) > 503 {
 		t.Fatalf("oversized upstream body not bounded: len = %d", len(eErr.Message))
 	}
 }
@@ -439,7 +439,9 @@ func TestConvertMessagesCacheUsageDetails(t *testing.T) {
 			t.Fatal(err)
 		}
 		u := m["usage"].(map[string]any)
-		if u["prompt_tokens"] != float64(8) && u["input_tokens"] != float64(8) {
+		// input_tokens is the upstream full count (cache included),
+		// with the cache breakdown alongside for clients to discount.
+		if u["prompt_tokens"] != float64(4) && u["input_tokens"] != float64(4) {
 			t.Fatalf("%s input = %v", format, u)
 		}
 		if format == "openai-response" && (u["input_tokens_details"].(map[string]any)["cached_tokens"] != float64(3) || u["input_tokens_details"].(map[string]any)["cache_write_tokens"] != float64(1)) {

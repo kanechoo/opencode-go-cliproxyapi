@@ -747,19 +747,25 @@ func (e ResponsesEventEmitter) Completed(status string, usage ResponsesUsage, ou
 	})
 }
 
+// snippetLen bounds the redacted error snippet: 80 chars hid real upstream
+// diagnostics (e.g. a stream-open 400 whose reason sits past the cut), so
+// snippets keep up to 500 chars — still a bounded, redacted excerpt, never
+// an upstream body echo (FR-011).
+const snippetLen = 500
+
 // RedactedSnippet bearer-redacts and truncates a payload snippet for error
 // messages — never an upstream body echo (FR-011).
 func RedactedSnippet(s string) string {
 	s = errclass.Redact(s)
-	if len(s) > 80 {
-		return s[:80] + "..."
+	if len(s) > snippetLen {
+		return s[:snippetLen] + "..."
 	}
 	return s
 }
 
 // snippetBound bounds redaction work: only the head of an oversized error
-// body can reach the 80-char snippet, so every upstream >=400 site
-// truncates to this size before scanning (FR-011).
+// body can reach the snippet, so every upstream >=400 site truncates to
+// this size before scanning (FR-011).
 const snippetBound = 4096
 
 // UpstreamStatusError classifies an upstream >=400 response body into one
@@ -799,18 +805,6 @@ type UsageDetails struct {
 	CachedTokens     *int64
 	CacheWriteTokens *int64
 	ReasoningTokens  *int64
-}
-
-func ClampSubtract(value int64, parts ...*int64) int64 {
-	for _, part := range parts {
-		if part != nil {
-			value -= *part
-		}
-	}
-	if value < 0 {
-		return 0
-	}
-	return value
 }
 
 // NewResponsesUsageFrom builds the struct form of the Responses usage
@@ -1202,20 +1196,38 @@ func ThinkingEnabled(t *ClaudeThinking) bool {
 	return t != nil && t.Type == "enabled"
 }
 
+// decodeOutputEffort extracts the adaptive-thinking effort string from an
+// output_config object ({"effort":"high"}), returning "" when absent or not
+// a non-empty string. It never fails: a malformed control degrades to
+// absent so renderers fall back to their default reasoning posture.
+func decodeOutputEffort(raw json.RawMessage) string {
+	if !HasContent(raw) {
+		return ""
+	}
+	var obj struct {
+		Effort string `json:"effort"`
+	}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(obj.Effort)
+}
+
 // ClaudeBlock is one normalized Anthropic Messages content block produced
 // by DecodeClaudeMessages: Kind carries the wire "type" and only the
 // fields that kind uses are populated. Image URLs arrive pre-resolved
 // through ClaudeImageURL; tool_use Input and tool_result Result stay raw
 // so each target renderer applies its own vocabulary and policies.
 type ClaudeBlock struct {
-	Kind    string          // text, image, tool_use, tool_result, thinking, redacted_thinking, or an unknown wire type
-	Text    string          // text blocks
-	URL     string          // image blocks: resolved http(s)/data URL
-	CallID  string          // tool_use "id" / tool_result "tool_use_id"
-	Name    string          // tool_use name
-	Input   json.RawMessage // tool_use arguments (absent → nil)
-	Result  json.RawMessage // tool_result payload (string or block array)
-	IsError bool            // tool_result is_error flag
+	Kind      string          // text, image, tool_use, tool_result, thinking, redacted_thinking, or an unknown wire type
+	Text      string          // text blocks
+	Reasoning string          // thinking-block reasoning text (empty for redacted_thinking: encrypted, never mapped)
+	URL       string          // image blocks: resolved http(s)/data URL
+	CallID    string          // tool_use "id" / tool_result "tool_use_id"
+	Name      string          // tool_use name
+	Input     json.RawMessage // tool_use arguments (absent → nil)
+	Result    json.RawMessage // tool_result payload (string or block array)
+	IsError   bool            // tool_result is_error flag
 }
 
 // ClaudeMessageRecord is one Anthropic Messages message turn: Content is
@@ -1242,6 +1254,7 @@ type ClaudeRequestRecord struct {
 	ToolChoiceKind string
 	ToolChoiceName string
 	Thinking       *ClaudeThinking
+	Effort         string // output_config.effort (adaptive-thinking control; "" when absent)
 	Stream         bool
 	Temperature    *float64
 	TopP           *float64
@@ -1255,9 +1268,10 @@ type claudeWireMessage struct {
 
 // claudeWireBlock mirrors the inbound Anthropic block shape (decode-only).
 type claudeWireBlock struct {
-	Type   string `json:"type"`
-	Text   string `json:"text"`
-	Source *struct {
+	Type     string `json:"type"`
+	Text     string `json:"text"`
+	Thinking string `json:"thinking"` // thinking-block reasoning text
+	Source   *struct {
 		Type      string `json:"type"` // base64 | url
 		MediaType string `json:"media_type"`
 		Data      string `json:"data"`
@@ -1288,6 +1302,7 @@ func DecodeClaudeMessages(body json.RawMessage) (*ClaudeRequestRecord, *errclass
 		Tools         []ClaudeTool        `json:"tools"`
 		ToolChoice    json.RawMessage     `json:"tool_choice"`
 		Thinking      *ClaudeThinking     `json:"thinking"`
+		OutputConfig  json.RawMessage     `json:"output_config"`
 		Stream        bool                `json:"stream"`
 		Temperature   *float64            `json:"temperature"`
 		TopP          *float64            `json:"top_p"`
@@ -1303,6 +1318,10 @@ func DecodeClaudeMessages(body json.RawMessage) (*ClaudeRequestRecord, *errclass
 	if eErr != nil {
 		return nil, eErr
 	}
+	// output_config.effort is the adaptive-thinking control (Claude 4.6+ /
+	// Claude Code 2.x): decoded here as a plain string so every renderer
+	// can map it; validation stays with the renderer (capability-aware).
+	effort := decodeOutputEffort(env.OutputConfig)
 	rec := &ClaudeRequestRecord{
 		MaxTokens:      ClaudeMaxTokens(env.MaxTokens),
 		System:         system,
@@ -1311,6 +1330,7 @@ func DecodeClaudeMessages(body json.RawMessage) (*ClaudeRequestRecord, *errclass
 		ToolChoiceKind: kind,
 		ToolChoiceName: name,
 		Thinking:       env.Thinking,
+		Effort:         effort,
 		Stream:         env.Stream,
 		Temperature:    env.Temperature,
 		TopP:           env.TopP,
@@ -1350,7 +1370,7 @@ func decodeClaudeBlocks(raw json.RawMessage) ([]ClaudeBlock, *errclass.Error) {
 			return nil, errclass.Translation("malformed content block")
 		}
 		blk := ClaudeBlock{
-			Kind: wb.Type, Text: wb.Text,
+			Kind: wb.Type, Text: wb.Text, Reasoning: wb.Thinking,
 			Name: wb.Name, Input: wb.Input,
 			Result: wb.Content, IsError: wb.IsError,
 		}

@@ -334,7 +334,11 @@ func (sc *StreamConverter) dispatchResponses(etype string, ev *sseEvent, events 
 // close cannot diverge from the normal-path shape.
 func (sc *StreamConverter) responsesCompleted() [][]byte {
 	status := shared.ResponseStatusFromClaudeStop(sc.stopReason)
-	usage := shared.NewResponsesUsageFrom(sc.promptTokens+valueOrZero(sc.cacheRead)+valueOrZero(sc.cacheCreation), sc.completionTokens,
+	// Upstream input_tokens is already the full count (cache hits
+	// included): pass through verbatim with the cache breakdown
+	// alongside, never add or subtract — clients compute discounts and
+	// context share from full+detail themselves.
+	usage := shared.NewResponsesUsageFrom(sc.promptTokens, sc.completionTokens,
 		shared.UsageDetails{CachedTokens: sc.cacheRead, CacheWriteTokens: sc.cacheCreation})
 	out := sc.responsesDoneEvents()
 	return append(out, sc.responsesEm().Completed(status, usage, sc.outputItems()))
@@ -483,7 +487,8 @@ func (sc *StreamConverter) emitChunk(events *[][]byte, delta map[string]any, fin
 	}
 	var usage map[string]any
 	if withUsage {
-		usage = shared.CCUsageFrom(sc.promptTokens+valueOrZero(sc.cacheRead)+valueOrZero(sc.cacheCreation), sc.completionTokens,
+		// Full-count passthrough, same policy as responsesCompleted above.
+		usage = shared.CCUsageFrom(sc.promptTokens, sc.completionTokens,
 			shared.UsageDetails{CachedTokens: sc.cacheRead})
 	}
 	*events = append(*events, b.Finish(finish, usage))

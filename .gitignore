@@ -1,0 +1,6 @@
+# Local build outputs (release artifacts ship via CI, see .github/workflows/build.yml)
+dist/
+*.so
+*.dylib
+*.dll
+*.h

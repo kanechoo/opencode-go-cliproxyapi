@@ -103,10 +103,11 @@ type ccContentPart struct {
 }
 
 type ccMessage struct {
-	Role       string              `json:"role"`
-	Content    any                 `json:"content"` // string, []ccContentPart, or nil
-	ToolCalls  []shared.CCToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string              `json:"tool_call_id,omitempty"`
+	Role             string              `json:"role"`
+	Content          any                 `json:"content"` // string, []ccContentPart, or nil
+	ReasoningContent string              `json:"reasoning_content,omitempty"`
+	ToolCalls        []shared.CCToolCall `json:"tool_calls,omitempty"`
+	ToolCallID       string              `json:"tool_call_id,omitempty"`
 }
 
 type ccRequest struct {
@@ -161,9 +162,12 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 	if len(src.StopSequences) > 0 {
 		out.Stop = src.StopSequences
 	}
-	if shared.ThinkingEnabled(src.Thinking) {
-		out.ReasoningEffort = thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts)
-	}
+	// Reasoning posture (FR-005): an explicit output_config.effort wins
+	// when valid for the target's capability, else the thinking budget
+	// maps via EffortFromBudget. thinking:adaptive carries no budget, so
+	// without this the effort:high control is silently dropped and the
+	// upstream never enters the thinking mode the session requires.
+	out.ReasoningEffort = reasoningEffortFor(src, ts)
 	applyToolChoiceCC(out, src.ToolChoiceKind, src.ToolChoiceName)
 	if src.System != "" {
 		out.Messages = append(out.Messages, ccMessage{Role: "system", Content: src.System})
@@ -218,6 +222,24 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 		})
 	}
 	return encode(out), nil
+}
+
+// reasoningEffortFor resolves the outbound reasoning_effort from the two
+// Claude-side controls: an explicit output_config.effort is validated
+// against the target's capability (rejected controls degrade to absent,
+// never fabricated); otherwise an enabled thinking budget maps via
+// EffortFromBudget. Empty means neither control requests reasoning.
+func reasoningEffortFor(src *shared.ClaudeRequestRecord, ts *pluginapi.ThinkingSupport) string {
+	if src.Effort != "" {
+		if eErr := thinking.ValidateEffort(src.Effort, ts); eErr == nil {
+			return strings.ToLower(strings.TrimSpace(src.Effort))
+		}
+		return ""
+	}
+	if shared.ThinkingEnabled(src.Thinking) {
+		return thinking.EffortFromBudget(src.Thinking.BudgetTokens, ts)
+	}
+	return ""
 }
 
 // claudeResultText flattens tool_result content (string or text blocks)
@@ -279,22 +301,30 @@ func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.E
 }
 
 // claudeAssistantMessage converts an assistant turn: text blocks join
-// the message content, tool_use blocks become tool_calls. Historical
-// thinking and redacted_thinking blocks have no Chat Completions
-// representation and are omitted by the FR-005 explicit omission policy
-// (the forward-looking control maps via effortFromBudget instead; the
-// redacted variant is pure encrypted metadata). Returns nil for empty turns.
+// the message content, tool_use blocks become tool_calls, and thinking
+// blocks map to reasoning_content — DeepSeek-style thinking-mode upstreams
+// reject turns that drop the reasoning history ("must be passed back").
+// redacted_thinking stays omitted: pure encrypted metadata with no
+// reasoning payload, matching the host (FR-005 explicit omission policy).
+// Returns nil for empty turns.
 func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclass.Error) {
 	msg := &ccMessage{Role: "assistant"}
-	var sb strings.Builder
+	var sb, reasoning strings.Builder
 	sb.WriteString(m.Content)
 	for i := range m.Blocks {
 		blk := &m.Blocks[i]
 		switch blk.Kind {
 		case "text":
 			sb.WriteString(blk.Text)
-		case "thinking", "redacted_thinking":
-			// omitted: no Chat Completions equivalent (FR-005 policy)
+		case "thinking":
+			if strings.TrimSpace(blk.Reasoning) != "" {
+				if reasoning.Len() > 0 {
+					reasoning.WriteString("\n")
+				}
+				reasoning.WriteString(blk.Reasoning)
+			}
+		case "redacted_thinking":
+			// omitted: encrypted metadata, never mapped (matches host AC2)
 		case "tool_use":
 			tc := shared.CCToolCall{ID: blk.CallID, Type: "function"}
 			tc.Function.Name = blk.Name
@@ -307,7 +337,10 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 	if sb.Len() > 0 {
 		msg.Content = sb.String()
 	}
-	if msg.Content == nil && len(msg.ToolCalls) == 0 {
+	if reasoning.Len() > 0 {
+		msg.ReasoningContent = reasoning.String()
+	}
+	if msg.Content == nil && len(msg.ToolCalls) == 0 && msg.ReasoningContent == "" {
 		return nil, nil
 	}
 	return msg, nil

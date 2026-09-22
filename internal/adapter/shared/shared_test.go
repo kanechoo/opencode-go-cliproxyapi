@@ -305,9 +305,9 @@ func TestRedactedSnippet(t *testing.T) {
 	if got := RedactedSnippet("Bearer sk-secret-123 rest"); got != "Bearer [redacted] rest" {
 		t.Fatalf("redaction = %q", got)
 	}
-	long := strings.Repeat("a", 100)
+	long := strings.Repeat("a", snippetLen+100)
 	got := RedactedSnippet(long)
-	if got != long[:80]+"..." {
+	if got != long[:snippetLen]+"..." {
 		t.Fatalf("truncation = %d chars, tail %q", len(got), got[len(got)-4:])
 	}
 	short := "plain text"
@@ -325,11 +325,17 @@ func TestUpstreamStatusError(t *testing.T) {
 		t.Fatalf("secret leaked: %q", e.Message)
 	}
 
-	// Oversized bodies are truncated before snippet extraction, so the
-	// message stays snippet-sized regardless of body size.
-	for _, size := range []int{100, 4096, 4097, 1 << 20} {
+	// Bodies under the snippet bound pass through whole; oversized bodies
+	// are truncated to a bounded redacted snippet, never echoed whole.
+	for _, size := range []int{100, snippetLen} {
 		e = UpstreamStatusError(500, []byte(strings.Repeat("x", size)))
-		if len(e.Message) > 83 || !strings.HasSuffix(e.Message, "...") {
+		if e.Message != strings.Repeat("x", size) {
+			t.Fatalf("size %d not passed through: %q", size, e.Message)
+		}
+	}
+	for _, size := range []int{snippetLen + 1, 4096, 4097, 1 << 20} {
+		e = UpstreamStatusError(500, []byte(strings.Repeat("x", size)))
+		if len(e.Message) > snippetLen+3 || !strings.HasSuffix(e.Message, "...") {
 			t.Fatalf("size %d not bounded: %d chars", size, len(e.Message))
 		}
 	}
@@ -789,7 +795,7 @@ func TestUsageFrom(t *testing.T) {
 	}
 }
 
-func TestUsageDetailsPreserveZeroAndClamp(t *testing.T) {
+func TestUsageDetailsPreserveZero(t *testing.T) {
 	zero := int64(0)
 	read := int64(4)
 	write := int64(3)
@@ -802,9 +808,6 @@ func TestUsageDetailsPreserveZeroAndClamp(t *testing.T) {
 	resp := NewResponsesUsageFrom(7, 5, UsageDetails{CachedTokens: &read, CacheWriteTokens: &write})
 	if resp.InputDetails == nil || *resp.InputDetails.CachedTokens != 4 || *resp.InputDetails.CacheWriteTokens != 3 || resp.TotalTokens != 12 {
 		t.Fatalf("responses details wrong: %+v", resp)
-	}
-	if got := ClampSubtract(2, &read, &write); got != 0 {
-		t.Fatalf("ClampSubtract = %d, want 0", got)
 	}
 }
 

@@ -28,8 +28,8 @@ func TestConvertResponsesStatusErrors(t *testing.T) {
 	}
 
 	// Long bodies are bounded to a redacted snippet, never echoed whole.
-	_, eErr = ConvertNonStreamResponse("openai", 500, []byte(strings.Repeat("z", 200)))
-	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 83 {
+	_, eErr = ConvertNonStreamResponse("openai", 500, []byte(strings.Repeat("z", 600)))
+	if eErr == nil || !strings.HasSuffix(eErr.Message, "...") || len(eErr.Message) > 503 {
 		t.Fatalf("upstream body not bounded: %q", eErr.Message)
 	}
 }
@@ -351,7 +351,9 @@ func TestConvertResponsesUsageDetailsAndAbsentUsage(t *testing.T) {
 			if u["prompt_tokens"] != float64(10) || u["prompt_tokens_details"].(map[string]any)["cached_tokens"] != float64(7) || u["completion_tokens_details"].(map[string]any)["reasoning_tokens"] != float64(3) {
 				t.Fatalf("chat usage = %v", u)
 			}
-		} else if u["input_tokens"] != float64(1) || u["cache_read_input_tokens"] != float64(7) || u["cache_creation_input_tokens"] != float64(2) {
+			// input_tokens is the upstream full count (cache included),
+			// with the cache breakdown alongside for clients to discount.
+		} else if u["input_tokens"] != float64(10) || u["cache_read_input_tokens"] != float64(7) || u["cache_creation_input_tokens"] != float64(2) {
 			t.Fatalf("claude usage = %v", u)
 		}
 	}

@@ -228,8 +228,12 @@ func responsesToClaude(body []byte) ([]byte, *errclass.Error) {
 		cacheRead = resp.Usage.InputDetails.CachedTokens
 		cacheWrite = resp.Usage.InputDetails.CacheWriteTokens
 	}
+	// Upstream input_tokens is already the full count (cache hits
+	// included, Anthropic semantics): pass through verbatim with the
+	// cache breakdown alongside, never subtract — clients compute
+	// discounts and context share from full+detail themselves.
 	b, _ := json.Marshal(shared.NewClaudeResult(resp.ID, resp.Model, stop,
-		shared.ClampSubtract(resp.Usage.InputTokens, cacheRead, cacheWrite), resp.Usage.OutputTokens,
+		resp.Usage.InputTokens, resp.Usage.OutputTokens,
 		cacheRead, cacheWrite, blocks))
 	return b, nil // composed marshallable types only; cannot fail
 }

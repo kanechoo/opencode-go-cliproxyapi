@@ -176,6 +176,64 @@ func TestStreamConverterClaude(t *testing.T) {
 	}
 }
 
+// reasoning_content deltas stream as a thinking block (thinking_delta)
+// so the reasoning reaches client history for the next turn's replay;
+// text arriving later closes it first (Anthropic one-open-block rule).
+func TestStreamConverterClaudeReasoning(t *testing.T) {
+	sc := NewStreamConverter("claude")
+	evs := feedAll(t, sc,
+		`data: {"id":"r1","model":"m","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"plan"}}]}`,
+		`data: {"choices":[{"delta":{"reasoning_content":" A"}}]}`,
+		`data: {"choices":[{"delta":{"content":"hi"}}]}`)
+	if len(evs) != 7 {
+		t.Fatalf("want start+think start+2 think deltas+think stop+text start+text delta, got %v", evs)
+	}
+	if evs[1].Name != "content_block_start" ||
+		evs[1].Data["content_block"].(map[string]any)["type"] != "thinking" {
+		t.Fatalf("thinking block start wrong: %v", evs[1])
+	}
+	if d := evs[2].Data["delta"].(map[string]any); d["type"] != "thinking_delta" || d["thinking"] != "plan" {
+		t.Fatalf("first thinking_delta wrong: %v", evs[2])
+	}
+	if d := evs[3].Data["delta"].(map[string]any); d["thinking"] != " A" {
+		t.Fatalf("second thinking_delta wrong: %v", evs[3])
+	}
+	// Text opens at a new index after the thinking block stops.
+	if evs[4].Name != "content_block_stop" {
+		t.Fatalf("thinking block not closed before text: %v", evs[4])
+	}
+	if evs[5].Data["content_block"].(map[string]any)["type"] != "text" ||
+		evs[5].Data["index"] != float64(1) {
+		t.Fatalf("text block start wrong: %v", evs[5])
+	}
+	if d := evs[6].Data["delta"].(map[string]any); d["type"] != "text_delta" || d["text"] != "hi" {
+		t.Fatalf("text_delta wrong: %v", evs[6])
+	}
+
+	// Thinking-only stream closes cleanly on finish + DONE.
+	sc2 := NewStreamConverter("claude")
+	evs = feedAll(t, sc2,
+		`data: {"id":"r2","model":"m","choices":[{"index":0,"delta":{"reasoning_content":"pondering"}}]}`,
+		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`)
+	all, done, eErr := sc2.Feed([]byte("data: [DONE]\n\n"))
+	if eErr != nil || !done {
+		t.Fatalf("[DONE] must finish: %v", eErr)
+	}
+	evs = append(evs, parseEvents(t, all)...)
+	var sawThinkStart, sawThinkStop bool
+	for _, e := range evs {
+		if e.Name == "content_block_start" && e.Data["content_block"].(map[string]any)["type"] == "thinking" {
+			sawThinkStart = true
+		}
+		if e.Name == "content_block_stop" {
+			sawThinkStop = true
+		}
+	}
+	if !sawThinkStart || !sawThinkStop {
+		t.Fatalf("thinking-only stream must open and close the block: %v", evs)
+	}
+}
+
 // Pure tool-call streams (function_call deltas + done, zero content) must
 // mirror non-stream chatToClaude's shape: only tool_use blocks, starting
 // at index 0 — no phantom empty text block opened ahead of them (FR-006
@@ -458,13 +516,15 @@ func TestStreamConverterClaudeVariants(t *testing.T) {
 	})
 	t.Run("malformed chunk errors with short snippet", func(t *testing.T) {
 		sc := NewStreamConverter("claude")
-		payload := `{"choices":[{"delta":{"content":"` + strings.Repeat("x", 200)
+		payload := `{"choices":[{"delta":{"content":"` + strings.Repeat("x", 600)
 		_, _, eErr := sc.Feed([]byte("data: " + payload + "\n"))
 		if eErr == nil || eErr.Class != errclass.ClassTranslation {
 			t.Fatalf("want ClassTranslation, got %+v", eErr)
 		}
-		if len(eErr.Message) > 160 || strings.Contains(eErr.Message, payload[100:]) {
-			t.Fatalf("error echoes too much upstream body: %q", eErr.Message)
+		// Prefix + 500-char snippet + ellipsis; the 600-x payload must
+		// be cut, never echoed whole.
+		if len(eErr.Message) > 580 || !strings.HasSuffix(eErr.Message, "...") {
+			t.Fatalf("error echoes too much upstream body (%d chars): %q", len(eErr.Message), eErr.Message)
 		}
 	})
 	t.Run("partial line carried across feeds", func(t *testing.T) {
@@ -764,7 +824,7 @@ func TestStreamConverterMalformedChunkRedactsBearer(t *testing.T) {
 	if strings.Contains(eErr.Message, "sk-secret123") {
 		t.Fatalf("error leaks bearer token: %q", eErr.Message)
 	}
-	if len(eErr.Message) > 160 {
+	if len(eErr.Message) > 580 {
 		t.Fatalf("error not bounded: %d chars", len(eErr.Message))
 	}
 }

@@ -33,6 +33,8 @@ type StreamConverter struct {
 	textIndex    int                       // claude index of the currently-open text block
 	nextIndex    int                       // next output/block index
 	msgIndex     int                       // announced assistant message item index (-1 until text)
+	thinkOpen    bool                      // claude thinking content_block open
+	thinkIndex   int                       // claude index of the currently-open thinking block
 	tools        map[int64]*streamTool
 	toolOrder    []int64 // upstream tool_call indices in first-arrival order
 	toolsSeen    bool    // any tool_calls entry observed (terminal-reason precedence)
@@ -184,8 +186,27 @@ type ccToolCallDelta struct {
 }
 
 type ccDelta struct {
-	Content   string            `json:"content"`
-	ToolCalls []ccToolCallDelta `json:"tool_calls"`
+	Content          string            `json:"content"`
+	ReasoningContent json.RawMessage   `json:"reasoning_content"`
+	ToolCalls        []ccToolCallDelta `json:"tool_calls"`
+}
+
+// deltaReasoning extracts reasoning_content from a stream delta, which
+// arrives as a JSON string fragment (accumulated across chunks) or —
+// rarely — a part array; unparseable content degrades to "" per fragment.
+func deltaReasoning(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	return shared.JoinTexts(parts)
 }
 
 type ccChunkChoice struct {
@@ -307,6 +328,21 @@ func (sc *StreamConverter) claudeLine(line string) ([][]byte, *errclass.Error) {
 		return events, nil
 	}
 	choice := chunk.Choices[0]
+	// reasoning_content streams as thinking_delta inside a thinking block
+	// (host openai_claude_response precedent): without this the reasoning
+	// never reaches client history, and the next turn's replay omits it —
+	// which thinking-mode upstreams reject with "must be passed back".
+	if reasoning := deltaReasoning(choice.Delta.ReasoningContent); reasoning != "" {
+		if !sc.thinkOpen {
+			events = append(events, sc.stopBlocks()...)
+			sc.thinkIndex = sc.nextIndex
+			sc.nextIndex++
+			sc.thinkOpen = true
+			events = append(events, sc.claudeEm.ContentBlockStart(sc.thinkIndex, "thinking", map[string]any{"thinking": ""}))
+		}
+		events = append(events, sc.claudeEm.ContentBlockDelta(sc.thinkIndex,
+			map[string]any{"type": "thinking_delta", "thinking": reasoning}))
+	}
 	if choice.Delta.Content != "" {
 		// The text block opens lazily on first non-empty content so pure
 		// tool-call streams carry no phantom empty text block, matching
@@ -375,8 +411,11 @@ func (sc *StreamConverter) claudeTerminal() [][]byte {
 			cacheRead = sc.usage.PromptDetails.CachedTokens
 		}
 	}
+	// Full-count passthrough, same policy as non-stream chatToClaude:
+	// prompt_tokens already includes cache hits, with the breakdown
+	// alongside for clients to discount themselves.
 	return [][]byte{sc.claudeEm.MessageDelta(&reason,
-		shared.ClaudeUsage(shared.ClampSubtract(input, cacheRead), output, cacheRead, nil))}
+		shared.ClaudeUsage(input, output, cacheRead, nil))}
 }
 
 // stopText closes the open text content block, if any.
@@ -388,11 +427,22 @@ func (sc *StreamConverter) stopText() [][]byte {
 	return [][]byte{sc.claudeEm.ContentBlockStop(sc.textIndex)}
 }
 
-// stopBlocks closes the text block and every open tool_use block
-// exactly once; called before every content_block_start (so blocks never
-// overlap) and again (as a no-op) on finish_reason and [DONE].
+// stopThink closes the open thinking content block, if any.
+func (sc *StreamConverter) stopThink() [][]byte {
+	if !sc.thinkOpen {
+		return nil
+	}
+	sc.thinkOpen = false
+	return [][]byte{sc.claudeEm.ContentBlockStop(sc.thinkIndex)}
+}
+
+// stopBlocks closes the thinking block, the text block, and every open
+// tool_use block exactly once; called before every content_block_start
+// (so blocks never overlap) and again (as a no-op) on finish_reason and
+// [DONE].
 func (sc *StreamConverter) stopBlocks() [][]byte {
 	var events [][]byte
+	events = append(events, sc.stopThink()...)
 	events = append(events, sc.stopText()...)
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]

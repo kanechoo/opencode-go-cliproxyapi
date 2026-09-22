@@ -164,13 +164,13 @@ func TestStreamMalformedJSONRedactedSnippet(t *testing.T) {
 		t.Errorf("token not redacted: %q", eErr.Message)
 	}
 
-	long := "{oops" + strings.Repeat("A", 300)
+	long := "{oops" + strings.Repeat("A", 600)
 	_, _, eErr = feed(t, NewStreamConverter("openai"), "data: "+long+"\n\n")
 	if eErr == nil {
 		t.Fatal("want error")
 	}
-	// Shared RedactedSnippet truncates to 80 payload chars + "...".
-	if n := len(eErr.Message) - len("malformed SSE data JSON: "); n > 83 {
+	// Shared RedactedSnippet truncates to 500 payload chars + "...".
+	if n := len(eErr.Message) - len("malformed SSE data JSON: "); n > 503 {
 		t.Errorf("snippet too long: %d chars in %q", n, eErr.Message)
 	}
 	if !strings.HasSuffix(eErr.Message, "...") {
@@ -256,6 +256,9 @@ func TestStreamOpenAIFullFlow(t *testing.T) {
 	}
 }
 
+// Terminal message_delta usage is the authoritative full count (cache
+// included): the terminal snapshot wins over message_start, passed
+// through verbatim with the cache breakdown alongside.
 func TestStreamOpenAIUsageDetailsUseTerminalInputSnapshot(t *testing.T) {
 	sc := NewStreamConverter("openai")
 	events, _, eErr := feed(t, sc,
@@ -267,7 +270,7 @@ func TestStreamOpenAIUsageDetailsUseTerminalInputSnapshot(t *testing.T) {
 	}
 	frames := dataFrames(t, events)
 	usage := frames[len(frames)-1]["usage"].(map[string]any)
-	if usage["prompt_tokens"] != float64(538) || usage["completion_tokens"] != float64(6) ||
+	if usage["prompt_tokens"] != float64(410) || usage["completion_tokens"] != float64(6) ||
 		usage["prompt_tokens_details"].(map[string]any)["cached_tokens"] != float64(128) {
 		t.Fatalf("usage = %v", usage)
 	}

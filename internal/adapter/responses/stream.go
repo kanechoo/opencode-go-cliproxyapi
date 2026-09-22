@@ -512,8 +512,11 @@ func (sc *StreamConverter) terminal(incomplete bool, in, out int, details shared
 		events = append(events, em.ContentBlockStop(idx))
 	}
 	sc.openBlocks = nil
+	// Full-count passthrough, same policy as responsesToClaude: the
+	// input count already includes cache hits, with the breakdown
+	// alongside for clients to discount themselves.
 	events = append(events,
-		em.MessageDelta(&stop, shared.ClaudeUsage(shared.ClampSubtract(int64(in), cacheRead, cacheWrite), int64(out), cacheRead, cacheWrite)),
+		em.MessageDelta(&stop, shared.ClaudeUsage(int64(in), int64(out), cacheRead, cacheWrite)),
 		em.MessageStop(),
 	)
 	return events, true, nil

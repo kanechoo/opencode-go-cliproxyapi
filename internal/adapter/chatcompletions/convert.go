@@ -11,8 +11,27 @@ import (
 // ---- upstream Chat Completions response shapes (FR-006) ----
 
 type ccRespMessage struct {
-	Content   json.RawMessage     `json:"content"` // JSON string or part array
-	ToolCalls []shared.CCToolCall `json:"tool_calls"`
+	Content          json.RawMessage     `json:"content"` // JSON string or part array
+	ReasoningContent json.RawMessage     `json:"reasoning_content"`
+	ToolCalls        []shared.CCToolCall `json:"tool_calls"`
+}
+
+// reasoningText extracts upstream reasoning_content, which arrives either
+// as a plain string or a typed-part array (host collectOpenAIReasoningTexts
+// accepts both); empty or absent degrades to "" so callers emit nothing.
+func reasoningText(raw json.RawMessage) string {
+	if !shared.HasContent(raw) {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	var parts []map[string]any
+	if err := json.Unmarshal(raw, &parts); err != nil {
+		return ""
+	}
+	return shared.JoinTexts(parts)
 }
 
 type ccChoice struct {
@@ -100,6 +119,13 @@ func chatToClaude(body []byte) ([]byte, *errclass.Error) {
 	if eErr != nil {
 		return nil, eErr
 	}
+	// reasoning_content becomes a leading thinking block (host
+	// openai_claude_response precedent: signature-less, thinking text
+	// only) so multi-turn history keeps the reasoning the upstream
+	// thinking-mode session requires back.
+	if reasoning := reasoningText(choice.Message.ReasoningContent); reasoning != "" {
+		blocks = append([]claudeBlock{{"type": "thinking", "thinking": reasoning}}, blocks...)
+	}
 	toolUse, eErr := claudeToolUseBlocks(choice.Message.ToolCalls)
 	if eErr != nil {
 		return nil, eErr
@@ -116,8 +142,12 @@ func chatToClaude(body []byte) ([]byte, *errclass.Error) {
 	// length cannot downgrade tool_calls to max_tokens.
 	stop := shared.TerminalReason(len(choice.Message.ToolCalls) > 0,
 		"tool_use", shared.FinishToClaudeStop(choice.FinishReason))
+	// Upstream prompt_tokens is already the full count: pass through
+	// verbatim with the cache breakdown alongside, never subtract —
+	// clients compute discounts and context share from full+detail
+	// themselves.
 	b, _ := json.Marshal(shared.NewClaudeResult(resp.ID, resp.Model, stop,
-		shared.ClampSubtract(inputTokens, cacheRead), outputTokens, cacheRead, nil, append(blocks, toolUse...)))
+		inputTokens, outputTokens, cacheRead, nil, append(blocks, toolUse...)))
 	return b, nil // only marshallable composed types; cannot fail
 }
 

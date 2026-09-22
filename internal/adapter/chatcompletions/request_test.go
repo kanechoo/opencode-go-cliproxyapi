@@ -279,6 +279,89 @@ func TestBuildRequestThinkingEffort(t *testing.T) {
 	}
 }
 
+// output_config.effort is the adaptive-thinking control (Claude Code 2.x):
+// it maps to reasoning_effort so thinking-mode upstreams enter the mode
+// the session requires, instead of the control being silently dropped
+// (deepseek thinking-mode 400: reasoning_content "must be passed back").
+func TestBuildRequestOutputConfigEffort(t *testing.T) {
+	// Explicit effort passes through validated against capability.
+	m := mustBuild(t, "claude", `{"max_tokens":64,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}}`, nil)
+	if m["reasoning_effort"] != "high" {
+		t.Fatalf("reasoning_effort=%v want high", m["reasoning_effort"])
+	}
+	// thinking:adaptive without effort sets no reasoning_effort (no budget
+	// to derive one from) — the turn still forwards, only the posture is absent.
+	m = mustBuild(t, "claude", `{"max_tokens":64,"thinking":{"type":"adaptive"}}`, nil)
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("adaptive without effort must not set reasoning_effort: %v", m)
+	}
+	// Explicit effort wins over the budget-derived level.
+	m = mustBuild(t, "claude", `{"max_tokens":64,"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":"high"}}`, nil)
+	if m["reasoning_effort"] != "high" {
+		t.Fatalf("explicit effort must win: %v", m["reasoning_effort"])
+	}
+	// Unsupported effort for the model degrades to absent, never fabricated.
+	ts := &pluginapi.ThinkingSupport{Levels: []string{"low", "medium"}}
+	m = mustBuild(t, "claude", `{"max_tokens":64,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}}`, ts)
+	if _, ok := m["reasoning_effort"]; ok {
+		t.Fatalf("unsupported effort must degrade to absent: %v", m)
+	}
+	// Malformed output_config degrades to absent (falls back to budget).
+	m = mustBuild(t, "claude", `{"max_tokens":64,"thinking":{"type":"enabled","budget_tokens":1024},"output_config":{"effort":42}}`, nil)
+	if m["reasoning_effort"] != "low" {
+		t.Fatalf("malformed effort must fall back to budget: %v", m["reasoning_effort"])
+	}
+}
+
+// thinking blocks replay as reasoning_content on the assistant message so
+// thinking-mode upstreams get their history back; whitespace-only thinking
+// carries nothing and is omitted; redacted_thinking stays omitted.
+func TestBuildRequestThinkingReplay(t *testing.T) {
+	m := mustBuild(t, "claude", `{"messages":[
+		{"role":"assistant","content":[{"type":"thinking","thinking":"plan A"},{"type":"thinking","thinking":"plan B"},{"type":"text","text":"hi"}]}
+	]}`, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 message, got %v", msgs)
+	}
+	asst := msgs[0].(map[string]any)
+	if asst["reasoning_content"] != "plan A\nplan B" {
+		t.Fatalf("reasoning_content=%v", asst["reasoning_content"])
+	}
+	if asst["content"] != "hi" {
+		t.Fatalf("content=%v", asst["content"])
+	}
+
+	// Thinking-only turn: no content, no tool calls, reasoning only.
+	m = mustBuild(t, "claude", `{"messages":[
+		{"role":"assistant","content":[{"type":"thinking","thinking":"pondering"}]}
+	]}`, nil)
+	msgs = m["messages"].([]any)
+	if len(msgs) != 1 || msgs[0].(map[string]any)["reasoning_content"] != "pondering" {
+		t.Fatalf("thinking-only turn lost: %v", msgs)
+	}
+
+	// Whitespace-only thinking is omitted — the turn carries nothing.
+	m = mustBuild(t, "claude", `{"messages":[
+		{"role":"assistant","content":[{"type":"thinking","thinking":"  \n "}]}
+	]}`, nil)
+	if msgs := m["messages"].([]any); len(msgs) != 0 {
+		t.Fatalf("empty thinking turn must drop: %v", msgs)
+	}
+
+	// redacted_thinking is encrypted metadata, never mapped.
+	m = mustBuild(t, "claude", `{"messages":[
+		{"role":"assistant","content":[{"type":"redacted_thinking","data":"blob"},{"type":"text","text":"answer"}]}
+	]}`, nil)
+	asst = m["messages"].([]any)[0].(map[string]any)
+	if _, ok := asst["reasoning_content"]; ok {
+		t.Fatalf("redacted_thinking must stay omitted: %v", asst)
+	}
+	if asst["content"] != "answer" {
+		t.Fatalf("content=%v", asst["content"])
+	}
+}
+
 func TestBuildRequestClaude(t *testing.T) {
 	body := `{
 		"model":"x","max_tokens":256,"stream":true,"temperature":0.5,"top_p":0.9,
@@ -329,10 +412,14 @@ func TestBuildRequestClaude(t *testing.T) {
 	if user["content"] != "more" {
 		t.Fatalf("post-result text wrong: %v", user)
 	}
-	// thinking block dropped, tool_use kept: content null + tool_calls.
+	// thinking block replays as reasoning_content (thinking-mode
+	// upstreams reject turns that drop it), tool_use kept as tool_calls.
 	last := msgs[5].(map[string]any)
 	if last["role"] != "assistant" || last["content"] != nil {
 		t.Fatalf("thinking-only content wrong: %v", last)
+	}
+	if last["reasoning_content"] != "hmm" {
+		t.Fatalf("thinking not replayed as reasoning_content: %v", last)
 	}
 	lastCall := last["tool_calls"].([]any)[0].(map[string]any)
 	if lastCall["id"] != "t2" || lastCall["function"].(map[string]any)["arguments"] != "{}" {
@@ -466,17 +553,19 @@ func TestBuildRequestClaudeVariants(t *testing.T) {
 			t.Fatalf("assistant string content lost: %v", a)
 		}
 	})
-	t.Run("thinking-only assistant dropped", func(t *testing.T) {
+	t.Run("thinking-only assistant replays reasoning", func(t *testing.T) {
 		m := mustBuild(t, "claude",
 			`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]}]}`, nil)
-		if msgs := m["messages"].([]any); len(msgs) != 0 {
-			t.Fatalf("thinking-only assistant not dropped: %v", msgs)
+		msgs := m["messages"].([]any)
+		if len(msgs) != 1 || msgs[0].(map[string]any)["reasoning_content"] != "hmm" {
+			t.Fatalf("thinking-only assistant not replayed: %v", msgs)
 		}
 	})
 	// FR-005 omission policy parity: redacted_thinking is encrypted
 	// reasoning metadata with no Chat Completions representable payload —
-	// omitted like plain thinking, never a conversion failure (mirrors the
-	// sibling Messages/Responses-route converters).
+	// omitted, never a conversion failure; plain thinking replays as
+	// reasoning_content (mirrors the sibling Messages/Responses-route
+	// converters' omission of the redacted variant).
 	t.Run("redacted_thinking omitted alongside thinking", func(t *testing.T) {
 		m := mustBuild(t, "claude",
 			`{"messages":[{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"},{"type":"redacted_thinking","data":"x"},{"type":"text","text":"answer"}]}]}`, nil)
@@ -485,8 +574,8 @@ func TestBuildRequestClaudeVariants(t *testing.T) {
 			t.Fatalf("want one assistant message, got %d: %v", len(msgs), msgs)
 		}
 		a := msgs[0].(map[string]any)
-		if a["content"] != "answer" {
-			t.Fatalf("thinking blocks not omitted or text lost: %v", a)
+		if a["content"] != "answer" || a["reasoning_content"] != "hmm" {
+			t.Fatalf("thinking replay or text wrong: %v", a)
 		}
 	})
 	t.Run("redacted_thinking-only assistant dropped", func(t *testing.T) {
