@@ -459,8 +459,10 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 		t.Fatalf("static = %+v", static)
 	}
 	got := static.Models[0]
+	// glm-5.3 resolves limits from the built-in table (upstream catalog
+	// is id-only): clients need a real context denominator.
 	if got.ID != "opencode-go/glm-5.3" || got.Object != "model" || got.OwnedBy != ProviderID ||
-		got.DisplayName != "glm-5.3" || got.ContextLength != 0 || got.MaxCompletionTokens != 0 ||
+		got.DisplayName != "glm-5.3" || got.ContextLength != 1000000 || got.MaxCompletionTokens != 131072 ||
 		len(got.SupportedInputModalities) != 0 || len(got.SupportedOutputModalities) != 0 {
 		t.Fatalf("model info = %+v", got)
 	}

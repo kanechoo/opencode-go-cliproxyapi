@@ -80,6 +80,10 @@ route-overrides:
   gpt-5.6-luna:
     protocol: responses
     endpoint: /v1/responses
+model-limits:
+  deepseek-v4.1-flash:
+    context-length: 128000
+    max-output: 32000
 allow-http: true
 request-timeout: 5m
 max-response-bytes: 1024
@@ -112,6 +116,10 @@ max-response-bytes: 1024
 	o, ok := c.RouteOverrides["gpt-5.6-luna"]
 	if !ok || o.Protocol != "responses" || o.Endpoint != "/v1/responses" {
 		t.Errorf("RouteOverrides = %+v", c.RouteOverrides)
+	}
+	l, ok := c.ModelLimits["deepseek-v4.1-flash"]
+	if !ok || l.ContextLength != 128000 || l.MaxOutput != 32000 {
+		t.Errorf("ModelLimits = %+v", c.ModelLimits)
 	}
 	if !c.AllowHTTP {
 		t.Errorf("AllowHTTP = false")
@@ -264,6 +272,8 @@ func TestLoadRejections(t *testing.T) {
 			"route-overrides:\n  bad-model:\n    protocol: responses\n    endpoint: v1/x\n" + withKey,
 			"route-overrides[bad-model].endpoint: must start with /",
 		},
+		{"model-limits negative context", "model-limits:\n  m:\n    context-length: -1\n" + withKey, "model-limits[m].context-length: must not be negative"},
+		{"model-limits negative max-output", "model-limits:\n  m:\n    max-output: -5\n" + withKey, "model-limits[m].max-output: must not be negative"},
 		{"prefix enabled empty value", "model-prefix:\n  enabled: true\n  value: \"\"\n" + withKey, "model-prefix.value: invalid provider-ID characters"},
 		{"prefix with space", "model-prefix:\n  value: has space\n" + withKey, "model-prefix.value: invalid provider-ID characters"},
 		{"prefix leading dash", "model-prefix:\n  value: -lead\n" + withKey, "model-prefix.value: invalid provider-ID characters"},

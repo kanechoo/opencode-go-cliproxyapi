@@ -303,14 +303,20 @@ func (m *Manager) swap(entries []rawModel, extraWarns ...string) {
 		if display == "" {
 			display = e.ID
 		}
+		// The upstream catalog publishes no context/output limits, so
+		// resolve through the limits precedence (config override, then
+		// built-in table) instead of reporting zero — downstream
+		// /v1/models and clients (e.g. Paseo's context window) need a
+		// real denominator.
+		ctxLimit, outLimit := ResolveLimits(e.ID, e.ContextLength, e.MaxOutputTokens, configLimits(m.cfg))
 		rec := ModelRecord{
 			PublicID:     config.PublicID(m.cfg, e.ID),
 			UpstreamID:   e.ID,
 			DisplayName:  display,
 			Protocol:     route,
 			EndpointPath: endpoint,
-			ContextLimit: e.ContextLength,
-			OutputLimit:  e.MaxOutputTokens,
+			ContextLimit: ctxLimit,
+			OutputLimit:  outLimit,
 			InputModes:   inputModes,
 			OutputModes:  outputModes,
 			Thinking:     normalizeThinking(e.Thinking),
@@ -409,6 +415,19 @@ func firstNonEmpty(a, b []string) []string {
 		return a
 	}
 	return b
+}
+
+// configLimits adapts the operator's model-limits config map onto the
+// catalog ModelLimits shape ResolveLimits consumes; nil-safe.
+func configLimits(cfg config.Config) map[string]ModelLimits {
+	if len(cfg.ModelLimits) == 0 {
+		return nil
+	}
+	out := make(map[string]ModelLimits, len(cfg.ModelLimits))
+	for id, l := range cfg.ModelLimits {
+		out[id] = ModelLimits{Context: l.ContextLength, Output: l.MaxOutput}
+	}
+	return out
 }
 
 // normalizeThinking converts the decoded raw thinking object into its

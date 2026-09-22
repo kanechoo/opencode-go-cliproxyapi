@@ -47,6 +47,13 @@ type RouteOverride struct {
 	Endpoint string `yaml:"endpoint"`
 }
 
+// ModelLimitOverride carries operator-supplied context/output limits for
+// one upstream model ID (see catalog.ResolveLimits for precedence).
+type ModelLimitOverride struct {
+	ContextLength int64 `yaml:"context-length"`
+	MaxOutput     int64 `yaml:"max-output"`
+}
+
 type Config struct {
 	BaseURL          string
 	CatalogURL       string
@@ -55,6 +62,7 @@ type Config struct {
 	Catalog          Catalog
 	Protocols        Protocols
 	RouteOverrides   map[string]RouteOverride
+	ModelLimits      map[string]ModelLimitOverride
 	AllowHTTP        bool
 	RequestTimeout   time.Duration
 	MaxResponseBytes int64
@@ -64,16 +72,17 @@ type Config struct {
 // (apply default) from explicitly-set values including "" (validate as-is).
 // Unknown fields are ignored (host may pass extra keys).
 type rawConfig struct {
-	BaseURL          *string                  `yaml:"base-url"`
-	CatalogURL       *string                  `yaml:"catalog-url"`
-	ModelPrefix      rawPrefix                `yaml:"model-prefix"`
-	APIKeys          []rawKey                 `yaml:"api-keys"`
-	Catalog          rawCatalog               `yaml:"catalog"`
-	Protocols        rawProtocols             `yaml:"protocols"`
-	RouteOverrides   map[string]RouteOverride `yaml:"route-overrides"`
-	AllowHTTP        bool                     `yaml:"allow-http"`
-	RequestTimeout   *string                  `yaml:"request-timeout"`
-	MaxResponseBytes *int64                   `yaml:"max-response-bytes"`
+	BaseURL          *string                       `yaml:"base-url"`
+	CatalogURL       *string                       `yaml:"catalog-url"`
+	ModelPrefix      rawPrefix                     `yaml:"model-prefix"`
+	APIKeys          []rawKey                      `yaml:"api-keys"`
+	Catalog          rawCatalog                    `yaml:"catalog"`
+	Protocols        rawProtocols                  `yaml:"protocols"`
+	RouteOverrides   map[string]RouteOverride      `yaml:"route-overrides"`
+	ModelLimits      map[string]ModelLimitOverride `yaml:"model-limits"`
+	AllowHTTP        bool                          `yaml:"allow-http"`
+	RequestTimeout   *string                       `yaml:"request-timeout"`
+	MaxResponseBytes *int64                        `yaml:"max-response-bytes"`
 }
 
 type rawPrefix struct {
@@ -144,6 +153,7 @@ func Load(yamlBytes []byte) (Config, error) {
 			Responses:       orDefault(raw.Protocols.Responses, true),
 		},
 		RouteOverrides:   raw.RouteOverrides,
+		ModelLimits:      raw.ModelLimits,
 		AllowHTTP:        raw.AllowHTTP,
 		RequestTimeout:   requestTimeout,
 		MaxResponseBytes: orDefault(raw.MaxResponseBytes, DefaultMaxResponseBytes),
@@ -206,6 +216,14 @@ func (c Config) validate() error {
 		}
 		if !strings.HasPrefix(o.Endpoint, "/") {
 			return fmt.Errorf("route-overrides[%s].endpoint: must start with /", name)
+		}
+	}
+	for name, l := range c.ModelLimits {
+		if l.ContextLength < 0 {
+			return fmt.Errorf("model-limits[%s].context-length: must not be negative", name)
+		}
+		if l.MaxOutput < 0 {
+			return fmt.Errorf("model-limits[%s].max-output: must not be negative", name)
 		}
 	}
 	if c.ModelPrefix.Enabled && !validPrefix(c.ModelPrefix.Value) {

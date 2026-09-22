@@ -101,6 +101,15 @@ plugins:
           protocol: "messages"           # "chat-completions" | "messages" | "responses"
           endpoint: "/v1/messages"       # must start with /
 
+      # Per-model context/output limits (upstream catalog publishes id-only
+      # entries, so records would otherwise report 0 and clients cannot
+      # render a context window). Precedence: upstream value (when a future
+      # catalog gains these fields) > model-limits here > built-in table.
+      model-limits:
+        "new-model-id":
+          context-length: 200000         # must not be negative
+          max-output: 32000              # must not be negative
+
       # Execution settings
       request-timeout: "5m"              # upstream request timeout (default: "5m")
       max-response-bytes: 67108864       # max non-streaming response body size in bytes (default: 64 MiB)
@@ -122,6 +131,7 @@ plugins:
 | `protocols.messages` | `bool` | `true` | Protocol switch for Messages endpoints. |
 | `protocols.responses` | `bool` | `true` | Protocol switch for Responses endpoints. |
 | `route-overrides` | `map` | `{}` | Map of model ID to `{ protocol: "...", endpoint: "..." }` overriding built-in family routing. Valid protocols: `chat-completions`, `messages`, `responses`. |
+| `model-limits` | `map` | `{}` | Map of upstream model ID to `{ context-length: N, max-output: N }` filling in limits the upstream catalog omits. Precedence: upstream value > this map > built-in table; unknown IDs stay 0. |
 | `request-timeout` | `duration` | `5m` | Upstream HTTP request timeout. Must be positive. |
 | `max-response-bytes` | `int64` | `67108864` (64 MiB) | Maximum non-streaming response body size in bytes. |
 | `allow-http` | `bool` | `false` | When `true`, permits `http://` scheme in `base-url` / `catalog-url` for local testing. |
