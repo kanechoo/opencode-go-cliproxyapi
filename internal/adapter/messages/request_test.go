@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/errclass"
@@ -78,12 +78,9 @@ func TestBuildRequestClaudeSystemRoleFolded(t *testing.T) {
 	if msgs[0].(map[string]any)["role"] != "user" {
 		t.Errorf("remaining message role = %v", msgs[0])
 	}
-	sys, _ := m["system"].([]any)
-	if len(sys) != 2 {
-		t.Fatalf("want 2 system blocks, got %v", m["system"])
-	}
-	if sys[0].(map[string]any)["text"] != "top" || sys[1].(map[string]any)["text"] != "reminder" {
-		t.Errorf("system blocks out of order: %v", sys)
+	sys, _ := m["system"].(string)
+	if sys != "top\n\nreminder" {
+		t.Fatalf("want folded system string, got %v", m["system"])
 	}
 	// Unrelated claude-native fields must pass through untouched.
 	if m["stream"] != true {
@@ -115,8 +112,8 @@ func TestBuildRequestClaudeSystemRoleUnsupportedBlock(t *testing.T) {
 	body := []byte(`{"model":"m","max_tokens":8,` +
 		`"messages":[{"role":"system","content":[{"type":"tool_use","id":"t","name":"n","input":{}}]}]}`)
 	_, eErr := BuildRequest("m", "claude", body, nil)
-	if eErr == nil || eErr.Class != errclass.ClassTranslation {
-		t.Fatalf("want ClassTranslation, got %+v", eErr)
+	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
+		t.Fatalf("want ClassUnsupported, got %+v", eErr)
 	}
 }
 
@@ -419,13 +416,10 @@ func TestChatCompletionsErrors(t *testing.T) {
 			t.Errorf("%s: want ClassUnsupported, got %+v", c.name, eErr)
 		}
 	}
-	// A non-function tool type is skipped (FR-005 omission policy).
-	m, eErr := chatReq(t, `{"tools":[{"type":"web_search"}],"messages":[]}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	if _, ok := m["tools"]; ok {
-		t.Errorf("non-function tools not skipped: %v", m["tools"])
+	// A non-function tool type is unsupported_protocol_or_parameter (FR-009).
+	_, eErr := chatReq(t, `{"tools":[{"type":"web_search"}],"messages":[]}`)
+	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
+		t.Errorf("unknown tool type: want ClassUnsupported, got %+v", eErr)
 	}
 }
 
@@ -440,17 +434,10 @@ func TestChatCompletionsEmptyContentDropped(t *testing.T) {
 	}
 }
 
-func TestResponsesSkipsNamespaceTools(t *testing.T) {
-	m, eErr := respReq(t, `{"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"namespace","name":"subagents"}]}`)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	tools, ok := m["tools"].([]any)
-	if !ok || len(tools) != 1 {
-		t.Fatalf("tools = %v", m["tools"])
-	}
-	if tools[0].(map[string]any)["name"] != "shell" {
-		t.Errorf("function tool = %v", tools[0])
+func TestResponsesNamespaceWithoutToolsRejected(t *testing.T) {
+	_, eErr := respReq(t, `{"input":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}},{"type":"namespace","name":"subagents"}]}`)
+	if eErr == nil || eErr.Class != errclass.ClassTranslation {
+		t.Fatalf("want ClassTranslation, got %+v", eErr)
 	}
 }
 
@@ -547,6 +534,28 @@ func TestResponsesItems(t *testing.T) {
 	}
 }
 
+func TestFromResponsesRequest_FunctionCallOutputArray(t *testing.T) {
+	body := `{
+		"model":"opencode-go/glm-5.2",
+		"input":[
+			{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"file contents"}]}
+		]
+	}`
+	m, eErr := respReq(t, body)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d: %v", len(msgs), msgs)
+	}
+	out := msgs[1].(map[string]any)["content"].([]any)[0].(map[string]any)
+	if out["type"] != "tool_result" || out["tool_use_id"] != "c1" || out["content"] != "file contents" {
+		t.Errorf("function_call_output block = %v", out)
+	}
+}
+
 func TestResponsesReasoningOmittedWhenEmptySummary(t *testing.T) {
 	m, eErr := respReq(t, `{"input":[{"type":"reasoning","summary":[]}]}`)
 	if eErr != nil {
@@ -593,14 +602,15 @@ func TestChatCompletionsEmptyArgsToolImagesDefaultSchema(t *testing.T) {
 }
 
 func TestChatCompletionsUnknownEffort(t *testing.T) {
-	_, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"maximum"}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("want ClassUnsupported, got %+v", eErr)
+	// Transparent router: unlisted efforts pass through without local
+	// validation; upstream is the sole authority. Unknown levels resolve
+	// to no thinking block rather than a descriptive rejection.
+	if _, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"maximum"}`); eErr != nil {
+		t.Fatalf("maximum: want nil (passthrough), got %+v", eErr)
 	}
-	// undeclared canonical levels are rejected explicitly too (FR-005).
-	_, eErr = chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"max"}`)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("undeclared max: want ClassUnsupported, got %+v", eErr)
+	// undeclared canonical levels pass through too (FR-005).
+	if _, eErr := chatReq(t, `{"messages":[{"role":"user","content":"a"}],"reasoning_effort":"max"}`); eErr != nil {
+		t.Fatalf("undeclared max: want nil (passthrough), got %+v", eErr)
 	}
 }
 
@@ -633,13 +643,83 @@ func TestResponsesErrors(t *testing.T) {
 			t.Errorf("%s: want ClassUnsupported, got %+v", c.name, eErr)
 		}
 	}
-	// A non-function tool type is skipped (FR-005 omission policy).
-	m, eErr := respReq(t, `{"tools":[{"type":"web_search"}],"input":[]}`)
+	// Hosted web search tools are dropped on the Messages route
+	// (no function-calling equivalent); function tools proceed.
+	m, eErr := respReq(t, `{"tools":[{"type":"web_search"},{"type":"web_search_preview"},{"type":"function","name":"f"}],"input":[]}`)
 	if eErr != nil {
 		t.Fatalf("unexpected error: %v", eErr)
 	}
-	if _, ok := m["tools"]; ok {
-		t.Errorf("non-function tools not skipped: %v", m["tools"])
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("web_search not dropped: %v", m["tools"])
+	}
+	if tools[0].(map[string]any)["name"] != "f" {
+		t.Fatalf("function tool lost: %v", m["tools"])
+	}
+}
+
+func TestFromResponses_NamespaceChildUnrolls(t *testing.T) {
+	body := `{
+		"input": "hi",
+		"tools": [
+			{"type": "namespace", "name": "subagents", "tools": [
+				{"type": "function", "name": "spawn_agent", "description": "d", "parameters": {"type": "object"}}
+			]}
+		]
+	}`
+	out, eErr := BuildRequest("qwen", "openai-response", []byte(body), nil, shared.NewResponseTools())
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 flattened tool, got %+v", m["tools"])
+	}
+	if tools[0].(map[string]any)["name"] != "subagents__spawn_agent" {
+		t.Fatalf("expected flattened subagents__spawn_agent, got %v", tools[0].(map[string]any)["name"])
+	}
+}
+
+func TestFromResponses_NamespaceToolIgnored(t *testing.T) {
+	body := `{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "f1", "parameters": {"type": "object"}},
+			{"type": "namespace", "name": "subagents", "tools": []}
+		]
+	}`
+	m, eErr := respReq(t, body)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %+v", m["tools"])
+	}
+	if tools[0].(map[string]any)["name"] != "f1" {
+		t.Fatalf("expected tool name f1, got %v", tools[0].(map[string]any)["name"])
+	}
+}
+
+func TestFromChatCompletions_NamespaceToolIgnored(t *testing.T) {
+	body := `{
+		"messages": [{"role": "user", "content": "hi"}],
+		"tools": [
+			{"type": "function", "function": {"name": "f1", "parameters": {"type": "object"}}},
+			{"type": "namespace", "name": "subagents"}
+		]
+	}`
+	m, eErr := chatReq(t, body)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %+v", m["tools"])
+	}
+	if tools[0].(map[string]any)["name"] != "f1" {
+		t.Fatalf("expected tool name f1, got %v", tools[0].(map[string]any)["name"])
 	}
 }
 
@@ -975,5 +1055,115 @@ func TestParallelFalseNoneStillUnsupported(t *testing.T) { // row 7
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
 		!strings.Contains(eErr.Message, `"none"`) {
 		t.Fatalf("err = %v", eErr)
+	}
+}
+
+func TestFromResponses_ReasoningEffortPassthroughWithoutValidation(t *testing.T) {
+	body := `{"input":"hi","reasoning":{"effort":"xhigh"}}`
+	out, eErr := BuildRequest("claude-3-7-sonnet", "openai-response", []byte(body), nil)
+	if eErr != nil {
+		if eErr.Class == errclass.ClassUnsupported {
+			t.Fatalf("BuildRequest rejected xhigh with ClassUnsupported: %+v", eErr)
+		}
+		t.Fatalf("BuildRequest err = %+v, want nil (passthrough xhigh)", eErr)
+	}
+	_ = decodeReq(t, out)
+}
+
+func TestFromResponses_CustomToolCallAndOutput(t *testing.T) {
+	body := `{
+		"input": [
+			{"type": "message", "role": "user", "content": "run script"},
+			{"type": "custom_tool_call", "call_id": "call_c1", "name": "exec", "input": "text('ok');"},
+			{"type": "custom_tool_call_output", "call_id": "call_c1", "output": [{"type": "input_text", "text": "ok"}]}
+		]
+	}`
+	out, eErr := BuildRequest("claude-3-5-sonnet", "openai-response", []byte(body), nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 messages, got %d: %v", len(msgs), msgs)
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("message 1 role = %v, want assistant", asst["role"])
+	}
+	blocks := asst["content"].([]any)
+	var tu map[string]any
+	for _, raw := range blocks {
+		if b := raw.(map[string]any); b["type"] == "tool_use" {
+			tu = b
+		}
+	}
+	if tu == nil || tu["id"] != "call_c1" || tu["name"] != "exec" {
+		t.Fatalf("tool_use block wrong: %v", blocks)
+	}
+	user := msgs[2].(map[string]any)
+	if user["role"] != "user" {
+		t.Fatalf("message 2 role = %v, want user", user["role"])
+	}
+	var tr map[string]any
+	switch c := user["content"].(type) {
+	case []any:
+		for _, raw := range c {
+			if b := raw.(map[string]any); b["type"] == "tool_result" {
+				tr = b
+			}
+		}
+	case map[string]any:
+		if c["type"] == "tool_result" {
+			tr = c
+		}
+	}
+	if tr == nil || tr["tool_use_id"] != "call_c1" || tr["content"] != "ok" {
+		t.Fatalf("tool_result block wrong: %v", user["content"])
+	}
+}
+
+func TestInHistorySystemRoleInMessages(t *testing.T) {
+	body := []byte(`{"model":"orig","max_tokens":10,"system":"base",` +
+		`"messages":[{"role":"system","content":"in-history rules"},` +
+		`{"role":"user","content":"hi"},` +
+		`{"role":"system","content":"more rules"},` +
+		`{"role":"assistant","content":"hello"}]}`)
+	out, eErr := BuildRequest("minimax", "claude", body, nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeReq(t, out)
+	if m["model"] != "minimax" {
+		t.Errorf("model = %v", m["model"])
+	}
+	var sysTexts []string
+	switch sys := m["system"].(type) {
+	case string:
+		sysTexts = []string{sys}
+	case []any:
+		for _, b := range sys {
+			sysTexts = append(sysTexts, b.(map[string]any)["text"].(string))
+		}
+	default:
+		t.Fatalf("system = %v (%T), want folded base + in-history texts", m["system"], m["system"])
+	}
+	joined := strings.Join(sysTexts, "\n")
+	for _, want := range []string{"base", "in-history rules", "more rules"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("system missing %q: %v", want, sysTexts)
+		}
+	}
+	msgs := m["messages"].([]any)
+	for _, raw := range msgs {
+		if raw.(map[string]any)["role"] == "system" {
+			t.Fatalf("system turn must be folded into system field, got messages = %v", msgs)
+		}
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d: %v, want 2 (user + assistant)", len(msgs), msgs)
+	}
+	if msgs[0].(map[string]any)["role"] != "user" || msgs[1].(map[string]any)["role"] != "assistant" {
+		t.Errorf("messages roles = %v", msgs)
 	}
 }

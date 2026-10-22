@@ -15,7 +15,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/catalog"
@@ -35,9 +35,12 @@ var EndpointPath = catalog.RouteResponses.EndpointPath()
 // via the shared thinking package; nil falls back to the default ladder.
 // Unknown formats are ClassUnsupported; malformed input is
 // ClassTranslation; messages are descriptive and redacted.
-func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport, tools ...*shared.ResponseTools) ([]byte, *errclass.Error) {
 	switch sourceFormat {
 	case "openai-response":
+		if !strings.HasPrefix(strings.ToLower(upstreamModel), "gpt") {
+			return fromResponsesNormalized(upstreamModel, sourceBody, tools...)
+		}
 		return shared.RewriteModelID(upstreamModel, sourceBody, "openai-response")
 	case "openai":
 		return fromChatCompletions(upstreamModel, sourceBody, ts)
@@ -46,6 +49,158 @@ func BuildRequest(upstreamModel string, sourceFormat string, sourceBody []byte, 
 	default:
 		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
 	}
+}
+
+// fromResponsesNormalized normalizes a native Responses passthrough body
+// for non-GPT upstream models: merges additional_tools input items into
+// tools, unrolls namespace tools, rewrites custom tools to functions, and
+// strips search_content_types from web_search tools (the OpenCode Go
+// native Responses server only allows it on web_search_preview). Unknown
+// top-level fields pass through via the raw map.
+func fromResponsesNormalized(upstreamModel string, sourceBody []byte, tools ...*shared.ResponseTools) ([]byte, *errclass.Error) {
+	var src shared.ResponsesRequest
+	if err := json.Unmarshal(sourceBody, &src); err != nil {
+		return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(sourceBody, &raw); err != nil {
+		return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+	}
+	if raw == nil {
+		return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+	}
+
+	// Verbatim raw input preservation: decode input as raw messages so
+	// unmodeled fields (web_search_call action/status, reasoning
+	// summary/encrypted_content) survive byte-for-byte.
+	preserved := make([]json.RawMessage, 0)
+	inputTouched := false
+	if inputRaw, ok := raw["input"]; ok && len(inputRaw) > 0 && string(inputRaw) != "null" {
+		var items []json.RawMessage
+		if err := json.Unmarshal(inputRaw, &items); err == nil {
+			inputTouched = true
+			for _, item := range items {
+				var meta struct {
+					Type string `json:"type"`
+				}
+				_ = json.Unmarshal(item, &meta)
+				switch meta.Type {
+				case "additional_tools":
+					var at struct {
+						Tools []shared.RespTool `json:"tools"`
+					}
+					if err := json.Unmarshal(item, &at); err != nil {
+						return nil, errclass.Translation("additional_tools requires a tools array")
+					}
+					if at.Tools == nil {
+						return nil, errclass.Translation("additional_tools requires a tools array")
+					}
+					src.Tools = append(src.Tools, at.Tools...)
+				case "custom_tool_call":
+					var m map[string]json.RawMessage
+					if err := json.Unmarshal(item, &m); err != nil {
+						return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+					}
+					typeBytes, _ := json.Marshal("function_call")
+					m["type"] = typeBytes
+					if inRaw, ok := m["input"]; ok {
+						var s string
+						var argsStr string
+						if json.Unmarshal(inRaw, &s) == nil {
+							b, _ := json.Marshal(map[string]string{"input": s})
+							argsStr = string(b)
+						} else {
+							b, _ := json.Marshal(map[string]json.RawMessage{"input": inRaw})
+							argsStr = string(b)
+						}
+						ab, _ := json.Marshal(argsStr)
+						m["arguments"] = ab
+						delete(m, "input")
+					}
+					b, err := json.Marshal(m)
+					if err != nil {
+						return nil, errclass.Translation("failed to encode normalized Responses request: " + err.Error())
+					}
+					preserved = append(preserved, b)
+				case "custom_tool_call_output":
+					var m map[string]json.RawMessage
+					if err := json.Unmarshal(item, &m); err != nil {
+						return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+					}
+					typeBytes, _ := json.Marshal("function_call_output")
+					m["type"] = typeBytes
+					b, err := json.Marshal(m)
+					if err != nil {
+						return nil, errclass.Translation("failed to encode normalized Responses request: " + err.Error())
+					}
+					preserved = append(preserved, b)
+				case "compaction", "reasoning":
+					// Dropped: non-GPT upstreams reject historical reasoning and compaction blobs.
+				case "function_call":
+					var m map[string]json.RawMessage
+					if err := json.Unmarshal(item, &m); err != nil {
+						return nil, errclass.Translation("invalid Responses request body: malformed JSON")
+					}
+					var args string
+					if rawArgs, ok := m["arguments"]; ok {
+						_ = json.Unmarshal(rawArgs, &args)
+					}
+					ab, _ := json.Marshal(shared.DefaultArgs(args))
+					m["arguments"] = ab
+					b, err := json.Marshal(m)
+					if err != nil {
+						return nil, errclass.Translation("failed to encode normalized Responses request: " + err.Error())
+					}
+					preserved = append(preserved, b)
+				default:
+					preserved = append(preserved, item)
+				}
+			}
+		} else {
+			var s string
+			if json.Unmarshal(inputRaw, &s) != nil {
+				return nil, errclass.Translation("input must be a string or an array of items")
+			}
+		}
+	}
+
+	rt := shared.ResponseToolContext(tools)
+	toolReq := &shared.ResponsesRequest{Tools: src.Tools, ToolChoice: src.ToolChoice}
+	if _, eErr := rt.Normalize(toolReq, EndpointPath); eErr != nil {
+		return nil, eErr
+	}
+	src.Tools = toolReq.Tools
+	src.ToolChoice = toolReq.ToolChoice
+
+	modelBytes, _ := json.Marshal(upstreamModel)
+	raw["model"] = modelBytes
+
+	toolsClean := make([]any, len(src.Tools))
+	for i, t := range src.Tools {
+		if t.Type == "web_search" {
+			toolsClean[i] = map[string]any{"type": "web_search"}
+		} else {
+			toolsClean[i] = t
+		}
+	}
+	toolsBytes, _ := json.Marshal(toolsClean)
+	raw["tools"] = toolsBytes
+
+	if inputTouched {
+		inputBytes, _ := json.Marshal(preserved)
+		raw["input"] = inputBytes
+	}
+
+	if len(src.ToolChoice) > 0 {
+		raw["tool_choice"] = src.ToolChoice
+	}
+
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return nil, errclass.Translation("failed to encode normalized Responses request: " + err.Error())
+	}
+	return out, nil
 }
 
 // ---- target wire shape -------------------------------------------------
@@ -165,14 +320,9 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 		req.MaxOutputTokens = src.MaxCompletionTokens
 	}
 	if src.ReasoningEffort != "" {
-		if eErr := thinking.ValidateEffort(src.ReasoningEffort, ts); eErr != nil {
-			return nil, eErr
-		}
-		// The dynamic "auto" sentinel omits reasoning via the shared policy
-		// below; a declared "none" and every other validated value forward
-		// as-is (matching the CC-upstream leg).
-		if effort, ok := reasoningEffortFor(strings.ToLower(strings.TrimSpace(src.ReasoningEffort)), ts); ok {
-			req.Reasoning = map[string]any{"effort": effort}
+		norm := strings.ToLower(strings.TrimSpace(src.ReasoningEffort))
+		if norm != "auto" { // "auto" sentinel omits reasoning block (FR-005)
+			req.Reasoning = map[string]any{"effort": norm}
 		}
 	}
 
@@ -245,13 +395,8 @@ func fromChatCompletions(upstreamModel string, body []byte, ts *pluginapi.Thinki
 	req.Instructions = instr.String()
 
 	for _, t := range src.Tools {
-		if t.Type != "function" {
-			// Skip client-side-only tool types (e.g. Codex "namespace"
-			// tools driving sub-agents/MCP): they have no upstream
-			// equivalent, so rejecting them would fail every request
-			// that declares them. Function tools still translate
-			// (FR-005 omission policy).
-			continue
+		if eErr := shared.FunctionTool(t.Type, EndpointPath); eErr != nil {
+			return nil, eErr
 		}
 		req.Tools = append(req.Tools, shared.RespTool{
 			Type:        "function",
@@ -330,25 +475,27 @@ func fromClaudeMessages(upstreamModel string, body []byte, ts *pluginapi.Thinkin
 
 	for _, m := range src.Messages {
 		if m.Role == "system" {
-			// Same fold as the chat-route twin: Claude Code 2.x system
-			// reminders join the instructions (FR-005: map, never drop).
-			var sys strings.Builder
-			sys.WriteString(m.Content)
+			text := m.Content
 			for _, blk := range m.Blocks {
 				switch blk.Kind {
 				case "text":
-					sys.WriteString(blk.Text)
+					if text != "" {
+						text += "\n\n"
+					}
+					text += blk.Text
 				case "image":
 					return nil, shared.SystemImageRejected()
+				case "thinking", "redacted_thinking":
+					// omitted per the FR-005 policy in the doc comment
 				default:
 					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 				}
 			}
-			if sys.Len() > 0 {
+			if text != "" {
 				if req.Instructions != "" {
 					req.Instructions += "\n\n"
 				}
-				req.Instructions += sys.String()
+				req.Instructions += text
 			}
 			continue
 		}

@@ -44,27 +44,33 @@ type StreamConverter struct {
 	terminalSent bool            // claudeTerminal already emitted message_delta (Flush must still close with message_stop)
 	flushed      bool            // Flush already ran (one-shot guard)
 	respText     strings.Builder // openai-response accumulated output_text
+	respTools    *shared.ResponseTools
 }
 
 // streamTool accumulates one upstream tool_calls index; args collects
 // argument fragments so the terminal response.completed output carries the
 // complete call (FR-006).
 type streamTool struct {
-	blockIndex int
-	id         string
-	name       string
-	args       strings.Builder
-	stopped    bool // content_block_stop emitted
+	blockIndex    int
+	id            string
+	name          string
+	args          strings.Builder
+	stopped       bool // content_block_stop emitted
+	customEmitted int  // custom_tool_call_input bytes already emitted as deltas
 }
 
 // NewStreamConverter returns a converter translating Chat Completions
 // SSE into sourceFormat's stream shape.
-func NewStreamConverter(sourceFormat string) *StreamConverter {
-	return &StreamConverter{
+func NewStreamConverter(sourceFormat string, tools ...*shared.ResponseTools) *StreamConverter {
+	sc := &StreamConverter{
 		sourceFormat: sourceFormat,
 		msgIndex:     -1,
 		tools:        map[int64]*streamTool{},
 	}
+	if len(tools) > 0 && tools[0] != nil {
+		sc.respTools = tools[0]
+	}
+	return sc
 }
 
 // Feed consumes one upstream chunk (any split of the byte stream),
@@ -525,7 +531,17 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 		}
 		if tc.Function.Arguments != "" {
 			t.args.WriteString(tc.Function.Arguments)
-			events = append(events, sc.responsesEm().ArgsDelta(t.id, t.blockIndex, tc.Function.Arguments))
+			if sc.respTools.IsCustom(t.name) {
+				// Custom tool arguments stream as wrapped JSON
+				// ({"input":"..."}) that only unwraps once complete:
+				// only the newly-unwrapped input tail is emitted, so
+				// raw wrapper tokens never leak into client deltas.
+				if tail := shared.CustomInputTail(t.args.String(), &t.customEmitted); tail != "" {
+					events = append(events, sc.responsesEm().InputDelta(t.id, t.blockIndex, tail))
+				}
+			} else {
+				events = append(events, sc.responsesEm().ArgsDelta(t.id, t.blockIndex, tc.Function.Arguments))
+			}
 		}
 	}
 	if choice.FinishReason != "" && !sc.finished {
@@ -539,7 +555,7 @@ func (sc *StreamConverter) responsesLine(line string) ([][]byte, *errclass.Error
 // upstream chunk identity so this route's frames cannot diverge from the
 // sibling Messages-route synthesizer (FR-006).
 func (sc *StreamConverter) responsesEm() shared.ResponsesEventEmitter {
-	return shared.ResponsesEventEmitter{ID: sc.id, Model: sc.model}
+	return shared.ResponsesEventEmitter{ID: sc.id, Model: sc.model, Tools: sc.respTools}
 }
 
 // responsesTerminal renders the held response.completed exactly once,
@@ -561,36 +577,21 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 	// tools-first announcements), never displacing already-announced
 	// function_call items; this mirrors the Messages-route invariant that
 	// terminal output order equals announcement order (W4 pin).
-	em := sc.responsesEm()
 	text := sc.respText.String()
 	hasText := sc.msgIndex >= 0
-	// Close every announced item before the terminal completed event:
-	// Responses clients materialize assistant text and tool calls from
-	// output_item.done payloads, never from deltas alone, so omitting
-	// these drops the agent message client-side while usage still lands.
-	var out [][]byte
-	msgDones := func() {
-		out = append(out, em.TextDone(sc.id, sc.msgIndex, text))
-		out = append(out, em.ContentPartDone(sc.id, sc.msgIndex, text))
-		out = append(out, em.ItemDone(sc.msgIndex, shared.MessageItem(sc.id, text)))
-	}
-	oa := shared.NewOutputAssembler(sc.id)
+	oa := shared.NewOutputAssembler(sc.id, sc.respTools)
 	reserved := false
 	for _, idx := range sc.toolOrder {
 		t := sc.tools[idx]
 		if hasText && !reserved && t.blockIndex > sc.msgIndex {
 			oa.ReserveTextSlot()
-			msgDones()
 			reserved = true
 		}
 		args := shared.DefaultArgs(t.args.String())
-		out = append(out, em.ArgsDone(t.id, t.blockIndex, args))
-		out = append(out, em.ItemDone(t.blockIndex, shared.FunctionCallItem(t.id, t.name, args)))
 		oa.AppendFunctionCall(t.id, t.name, args)
 	}
 	if hasText && !reserved {
 		oa.ReserveTextSlot()
-		msgDones()
 	}
 	oa.AddText(text)
 	// Always attach (F-R6): zero-valued fields when upstream sent none.
@@ -609,6 +610,27 @@ func (sc *StreamConverter) responsesTerminal() [][]byte {
 		}
 	}
 	usage := shared.NewResponsesUsageFrom(input, outputTokens, details)
-	out = append(out, em.Completed(status, usage, oa.Render()))
-	return out
+	items := oa.Render()
+	em := sc.responsesEm()
+	var events [][]byte
+	for idx, item := range items {
+		v, ok := item.(shared.RespItem)
+		if !ok {
+			continue
+		}
+		switch v.Type {
+		case "message":
+			text := sc.respText.String()
+			events = append(events, em.TextDone(v.ID, idx, text))
+			events = append(events, em.ContentPartDone(v.ID, idx, text))
+			events = append(events, em.ItemDone(idx, v))
+		case "function_call":
+			events = append(events, em.ArgsDone(v.CallID, idx, v.Name, v.Arguments))
+			events = append(events, em.ItemDone(idx, v))
+		case "custom_tool_call":
+			events = append(events, em.InputDone(v.CallID, idx, v.Input))
+			events = append(events, em.ItemDone(idx, v))
+		}
+	}
+	return append(events, em.Completed(status, usage, items))
 }

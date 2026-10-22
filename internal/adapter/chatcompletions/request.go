@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/catalog"
@@ -35,22 +35,23 @@ func AuthHeaders(key string) http.Header {
 // degraded (FR-005). Unknown formats are ClassUnsupported; malformed
 // input is ClassTranslation. Errors are descriptive and redacted — no
 // silent loss of tools or reasoning controls.
-func BuildRequest(upstreamModel, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func BuildRequest(upstreamModel, sourceFormat string, sourceBody []byte, ts *pluginapi.ThinkingSupport, tools ...*shared.ResponseTools) ([]byte, *errclass.Error) {
 	switch sourceFormat {
 	case "openai":
 		return buildOpenAIRequest(upstreamModel, sourceBody)
 	case "claude":
 		return claudeToChat(upstreamModel, sourceBody, ts)
 	case "openai-response":
-		return responsesToChat(upstreamModel, sourceBody, ts)
+		return responsesToChat(upstreamModel, sourceBody, ts, shared.ResponseToolContext(tools))
 	default:
 		return nil, shared.UnsupportedFormat(sourceFormat, EndpointPath)
 	}
 }
 
 // buildOpenAIRequest rewrites the top-level model field of an OpenAI request
-// body to upstreamModel and strips any malformed top-level thinking object.
-// DeepSeek models fail if thinking lacks a valid string type field.
+// body to upstreamModel, normalizes role:"developer" messages to role:"system",
+// and strips any malformed top-level thinking object. DeepSeek models fail if
+// thinking lacks a valid string type field or if messages contain role:"developer".
 func buildOpenAIRequest(upstreamModel string, body []byte) ([]byte, *errclass.Error) {
 	var req map[string]json.RawMessage
 	if err := json.Unmarshal(body, &req); err != nil {
@@ -64,10 +65,30 @@ func buildOpenAIRequest(upstreamModel string, body []byte) ([]byte, *errclass.Er
 	if hasThinking && !validThinking {
 		delete(req, "thinking")
 	}
-	if raw, ok := req["model"]; ok && string(raw) == `"`+upstreamModel+`"` && (validThinking || !hasThinking) {
+
+	var msgsModified bool
+	if rawMsgs, ok := req["messages"]; ok && strings.Contains(string(rawMsgs), `"developer"`) {
+		var msgs []map[string]json.RawMessage
+		if err := json.Unmarshal(rawMsgs, &msgs); err == nil {
+			for _, m := range msgs {
+				var role string
+				if err := json.Unmarshal(m["role"], &role); err == nil && role == "developer" {
+					m["role"] = json.RawMessage(`"system"`)
+					msgsModified = true
+				}
+			}
+			if msgsModified {
+				if b, err := json.Marshal(msgs); err == nil {
+					req["messages"] = b
+				}
+			}
+		}
+	}
+	if raw, ok := req["model"]; ok && string(raw) == `"`+upstreamModel+`"` && (validThinking || !hasThinking) && !msgsModified {
 		return body, nil
 	}
 	req["model"] = json.RawMessage(`"` + upstreamModel + `"`)
+
 	b, err := json.Marshal(req)
 	if err != nil {
 		return nil, errclass.Translation("model id cannot be represented as JSON")
@@ -193,21 +214,21 @@ func claudeToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSuppo
 			// Claude Code 2.x system reminders arrive as role:"system"
 			// messages; Chat Completions natively supports the system
 			// role, so emit them directly (FR-005: map, never drop).
-			var sys strings.Builder
-			sys.WriteString(m.Content)
+			var sb strings.Builder
+			sb.WriteString(m.Content)
 			for i := range m.Blocks {
 				blk := &m.Blocks[i]
 				switch blk.Kind {
 				case "text":
-					sys.WriteString(blk.Text)
+					sb.WriteString(blk.Text)
 				case "image":
 					return nil, shared.SystemImageRejected()
 				default:
 					return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 				}
 			}
-			if sys.Len() > 0 {
-				out.Messages = append(out.Messages, ccMessage{Role: "system", Content: sys.String()})
+			if sb.Len() > 0 {
+				out.Messages = append(out.Messages, ccMessage{Role: "system", Content: sb.String()})
 			}
 		default:
 			return nil, shared.ValidateRole(m.Role, EndpointPath)
@@ -250,53 +271,60 @@ func claudeResultText(content json.RawMessage) (string, *errclass.Error) {
 	return shared.ToolResultText(content, "tool messages carry text only")
 }
 
-// claudeUserMessages converts a user turn into Chat Completions messages:
-// text/image blocks become one user message (plain string when only
-// text), each tool_result block becomes a separate role:"tool" message
-// carrying its tool_use_id (FR-005).
+// claudeUserMessages keeps all tool replies adjacent, then emits tool images
+// in a user message associated with their tool_call_id. This preserves parallel
+// tool-call protocol ordering and retains the original image bytes/URLs.
 func claudeUserMessages(m *shared.ClaudeMessageRecord) ([]ccMessage, *errclass.Error) {
 	var msgs []ccMessage
 	var parts []ccContentPart
-	flush := func() {
-		if len(parts) == 0 {
-			return
-		}
-		var c any = parts
-		if len(parts) == 1 && parts[0].Type == "text" {
-			c = parts[0].Text
-		}
-		msgs = append(msgs, ccMessage{Role: "user", Content: c})
-		parts = nil
-	}
 	if m.Content != "" {
 		parts = append(parts, ccContentPart{Type: "text", Text: m.Content})
 	}
-	for i := range m.Blocks {
-		blk := &m.Blocks[i]
+	for _, blk := range m.Blocks {
 		switch blk.Kind {
 		case "text":
 			parts = append(parts, ccContentPart{Type: "text", Text: blk.Text})
 		case "image":
 			parts = append(parts, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: blk.URL}})
 		case "tool_result":
-			text, eErr := claudeResultText(blk.Result)
+			result, eErr := shared.ToolResultParts(blk.Result)
 			if eErr != nil {
 				return nil, eErr
 			}
-			if blk.IsError {
-				// Same convention as the Responses-route twin so the
-				// flag is never silently erased (FR-005).
-				text = shared.ToolResultErrorPrefix + text
+			var text strings.Builder
+			hasImage := false
+			for _, part := range result {
+				if part.ImageURL != "" {
+					hasImage = true
+				} else {
+					text.WriteString(part.Text)
+				}
 			}
-			flush()
-			msgs = append(msgs, ccMessage{
-				Role: "tool", Content: text, ToolCallID: blk.CallID,
-			})
+			toolText := text.String()
+			if blk.IsError {
+				toolText = shared.ToolResultErrorPrefix + toolText
+			}
+			if hasImage {
+				toolText += "\n[Images from this tool result are in the following user message, labeled with tool_call_id " + blk.CallID + ".]"
+				parts = append(parts, ccContentPart{Type: "text", Text: "Tool result images for tool_call_id " + blk.CallID + ":"})
+				for _, part := range result {
+					if part.ImageURL != "" {
+						parts = append(parts, ccContentPart{Type: "image_url", ImageURL: &imageURLField{URL: part.ImageURL}})
+					}
+				}
+			}
+			msgs = append(msgs, ccMessage{Role: "tool", Content: toolText, ToolCallID: blk.CallID})
 		default:
 			return nil, shared.UnsupportedPartType(blk.Kind, EndpointPath)
 		}
 	}
-	flush()
+	if len(parts) > 0 {
+		var content any = parts
+		if len(parts) == 1 && parts[0].Type == "text" {
+			content = parts[0].Text
+		}
+		msgs = append(msgs, ccMessage{Role: "user", Content: content})
+	}
 	return msgs, nil
 }
 
@@ -357,7 +385,7 @@ func claudeAssistantMessage(m *shared.ClaudeMessageRecord) (*ccMessage, *errclas
 // same field), and max_output_tokens maps to max_tokens. Historical
 // reasoning items are omitted (no CC equivalent; FR-005 explicit omission
 // policy).
-func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport) ([]byte, *errclass.Error) {
+func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSupport, tools *shared.ResponseTools) ([]byte, *errclass.Error) {
 	var src shared.ResponsesRequest
 	if err := json.Unmarshal(body, &src); err != nil {
 		return nil, errclass.Translation("malformed openai-response request JSON: " + err.Error())
@@ -373,17 +401,8 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 		out.MaxTokens = src.MaxOutputTokens
 	}
 	if src.Reasoning != nil && src.Reasoning.Effort != "" {
-		if eErr := thinking.ValidateEffort(src.Reasoning.Effort, ts); eErr != nil {
-			return nil, eErr
-		}
 		out.ReasoningEffort = strings.ToLower(strings.TrimSpace(src.Reasoning.Effort))
 	}
-	kind, tcName, eErr := shared.DecodeToolChoice(src.ToolChoice)
-	if eErr != nil {
-		return nil, eErr
-	}
-	applyToolChoiceCC(out, kind, tcName)
-
 	addSystem := func(text string) {
 		if text != "" {
 			out.Messages = append(out.Messages, ccMessage{Role: "system", Content: text})
@@ -395,10 +414,15 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 	}
 	addSystem(instr)
 
-	items, eErr := src.DecodeInputItems()
+	items, eErr := tools.Normalize(&src, EndpointPath)
 	if eErr != nil {
 		return nil, eErr
 	}
+	kind, tcName, eErr := shared.DecodeToolChoice(src.ToolChoice)
+	if eErr != nil {
+		return nil, eErr
+	}
+	applyToolChoiceCC(out, kind, tcName)
 	for _, item := range items {
 		switch item.Type {
 		case "message":
@@ -431,10 +455,14 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 			default:
 				return nil, shared.ValidateRole(item.Role, EndpointPath)
 			}
-		case "function_call":
+		case "function_call", "custom_tool_call":
+			args := item.Arguments
+			if args == "" && item.Input != "" {
+				args = item.Input
+			}
 			tc := shared.CCToolCall{ID: item.CallID, Type: "function"}
 			tc.Function.Name = item.Name
-			tc.Function.Arguments = shared.DefaultArgs(item.Arguments)
+			tc.Function.Arguments = shared.DefaultArgs(args)
 			// Merge consecutive function_call items into one
 			// assistant message so multi-call turns round-trip.
 			if n := len(out.Messages); n > 0 {
@@ -447,9 +475,13 @@ func responsesToChat(upstreamModel string, body []byte, ts *pluginapi.ThinkingSu
 			out.Messages = append(out.Messages, ccMessage{
 				Role: "assistant", ToolCalls: []shared.CCToolCall{tc},
 			})
-		case "function_call_output":
+		case "function_call_output", "custom_tool_call_output":
+			text, eErr := shared.RespOutputText(item.Output, "tool messages carry text only")
+			if eErr != nil {
+				return nil, eErr
+			}
 			out.Messages = append(out.Messages, ccMessage{
-				Role: "tool", Content: item.Output, ToolCallID: item.CallID,
+				Role: "tool", Content: text, ToolCallID: item.CallID,
 			})
 		case "reasoning":
 			// omitted: no Chat Completions equivalent (FR-005 policy)

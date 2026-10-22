@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/errclass"
@@ -89,6 +89,211 @@ func TestPassthroughRewritesModelOnly(t *testing.T) {
 func TestPassthroughMalformed(t *testing.T) {
 	_, eErr := BuildRequest("m", "openai-response", []byte(`{`), nil)
 	wantErr(t, eErr, errclass.ClassTranslation)
+}
+
+func TestBuildRequest_ResponsesToResponses_NonGPTNormalized(t *testing.T) {
+	body := []byte(`{"model":"whatever","input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"say ok"}]},
+		{"type":"additional_tools","tools":[{"type":"function","name":"extra"}]}
+	],"tools":[
+		{"type":"custom","name":"exec"},
+		{"type":"web_search","search_content_types":["news"]}
+	]}`)
+
+	out, eErr := BuildRequest("muse-spark-1.3-contributor", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil", eErr)
+	}
+	m := decodeReq(t, out)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("missing tools: %v", m)
+	}
+	byName := map[string]map[string]any{}
+	for _, tl := range tools {
+		tm, ok := tl.(map[string]any)
+		if !ok {
+			t.Fatalf("tool not an object: %v", tl)
+		}
+		if typ, _ := tm["type"].(string); typ == "web_search" {
+			byName["web_search"] = tm
+			continue
+		}
+		if name, _ := tm["name"].(string); name != "" {
+			byName[name] = tm
+		}
+	}
+	exec, ok := byName["exec"]
+	if !ok {
+		t.Fatalf("exec tool missing: %v", tools)
+	}
+	if exec["type"] != "function" {
+		t.Errorf("exec type = %v, want function", exec["type"])
+	}
+	if exec["parameters"] == nil {
+		t.Errorf("exec parameters missing: %v", exec)
+	}
+	if _, ok := byName["extra"]; !ok {
+		t.Errorf("additional_tools not merged into tools: %v", tools)
+	}
+	if ws, ok := byName["web_search"]; ok {
+		if _, has := ws["search_content_types"]; has {
+			t.Errorf("search_content_types not stripped: %v", ws)
+		}
+	} else {
+		t.Errorf("web_search tool missing: %v", tools)
+	}
+	for _, item := range inputItems(t, m) {
+		if im, ok := item.(map[string]any); ok && im["type"] == "additional_tools" {
+			t.Errorf("additional_tools not stripped from input: %v", m["input"])
+			break
+		}
+	}
+
+	out, eErr = BuildRequest("gpt-6-luna", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest gpt err = %+v, want nil", eErr)
+	}
+	m = decodeReq(t, out)
+	tools, ok = m["tools"].([]any)
+	if !ok || len(tools) == 0 {
+		t.Fatalf("missing gpt tools: %v", m)
+	}
+	tl, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("gpt tool 0 not an object: %v", tools[0])
+	}
+	if tl["type"] != "custom" {
+		t.Errorf("gpt tools[0].type = %v, want custom (passthrough)", tl["type"])
+	}
+}
+
+func TestBuildRequest_ResponsesToResponses_PreservesRawInputFields(t *testing.T) {
+	// reasoning items are dropped for non-GPT upstreams (see
+	// TestBuildRequest_ResponsesToResponses_ReasoningItemDropped); only
+	// web_search_call and other non-reasoning items survive.
+	body := []byte(`{"input":[
+		{"type":"web_search_call","id":"ws_1","status":"completed","action":{"type":"search","query":"Happy Bunny"}},
+		{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"secret_data"}
+	]}`)
+	out, eErr := BuildRequest("muse-spark-1.3-contributor", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil", eErr)
+	}
+	items := inputItems(t, decodeReq(t, out))
+	if len(items) != 1 {
+		t.Fatalf("items = %d: %v", len(items), items)
+	}
+	ws := itemMap(t, items, 0)
+	if ws["status"] != "completed" {
+		t.Errorf("status = %v, want completed", ws["status"])
+	}
+	act, ok := ws["action"].(map[string]any)
+	if !ok {
+		t.Fatalf("web_search_call action lost: %v", ws)
+	}
+	if act["query"] != "Happy Bunny" {
+		t.Errorf("action.query = %v, want Happy Bunny", act["query"])
+	}
+}
+
+func TestBuildRequest_ResponsesToResponses_FunctionCallEmptyArgs(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"function_call","call_id":"c1","name":"lookup","arguments":""},
+		{"type":"function_call","call_id":"c2","name":"lookup"}
+	]}`)
+	out, eErr := BuildRequest("muse-spark-1.3-contributor", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil", eErr)
+	}
+	items := inputItems(t, decodeReq(t, out))
+	if len(items) != 2 {
+		t.Fatalf("items = %d: %v", len(items), items)
+	}
+	for i, want := range []string{"c1", "c2"} {
+		fc := itemMap(t, items, i)
+		if fc["type"] != "function_call" || fc["call_id"] != want || fc["arguments"] != "{}" {
+			t.Errorf("function_call %d = %v, want arguments {}", i, fc)
+		}
+	}
+}
+
+func TestBuildRequest_ResponsesToResponses_CompactionDropped(t *testing.T) {
+	// Both compaction and reasoning items are dropped for non-GPT upstreams.
+	body := []byte(`{"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"compaction","encrypted_content":"blob"},
+		{"type":"reasoning","id":"rs_1","summary":[]}
+	]}`)
+	out, eErr := BuildRequest("grok-4-6", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil", eErr)
+	}
+	items := inputItems(t, decodeReq(t, out))
+	if len(items) != 1 {
+		t.Fatalf("items = %d: %v", len(items), items)
+	}
+	for _, item := range items {
+		if im, ok := item.(map[string]any); ok && (im["type"] == "compaction" || im["type"] == "reasoning") {
+			t.Fatalf("compaction/reasoning not dropped: %v", items)
+		}
+	}
+}
+
+// TestBuildRequest_ResponsesToResponses_ReasoningItemDropped asserts that
+// historical `reasoning` input items containing encrypted blobs are dropped
+// when forwarding to non-GPT Responses models (e.g. grok, muse-spark).
+// Non-GPT upstreams cannot decrypt foreign pooled blobs, so they must be
+// stripped before the request is forwarded (matching the compaction-drop
+// policy).  For GPT models the passthrough path is taken and reasoning items
+// are preserved verbatim.
+//
+// RED: currently FAILS because the default branch in fromResponsesNormalized
+// preserves all unrecognised item types, including "reasoning".
+func TestBuildRequest_ResponsesToResponses_ReasoningItemDropped(t *testing.T) {
+	body := []byte(`{"input":[
+		{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+		{"type":"reasoning","id":"rs_1","summary":[],"encrypted_content":"blob"},
+		{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}
+	]}`)
+
+	// Non-GPT model: reasoning item must be dropped.
+	out, eErr := BuildRequest("grok-4.6", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil", eErr)
+	}
+	items := inputItems(t, decodeReq(t, out))
+	for _, item := range items {
+		if im, ok := item.(map[string]any); ok && im["type"] == "reasoning" {
+			t.Fatalf("reasoning item not dropped for non-GPT model: %v", items)
+		}
+	}
+
+	// GPT model: passthrough path — reasoning item must be preserved.
+	out, eErr = BuildRequest("gpt-6-luna", "openai-response", body, nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest gpt err = %+v, want nil", eErr)
+	}
+	m := decodeReq(t, out)
+	rawInput, ok := m["input"]
+	if !ok {
+		t.Fatalf("gpt passthrough: missing input field: %v", m)
+	}
+	gptItems, ok := rawInput.([]any)
+	if !ok {
+		// GPT passthrough may keep input as a raw string — accept it.
+		return
+	}
+	found := false
+	for _, item := range gptItems {
+		if im, ok := item.(map[string]any); ok && im["type"] == "reasoning" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("reasoning item lost on GPT passthrough: %v", gptItems)
+	}
 }
 
 func mustBuild(t *testing.T, model, format string, body []byte, ts *pluginapi.ThinkingSupport) []byte {
@@ -300,12 +505,13 @@ func TestFromChatCompletionsErrors(t *testing.T) {
 	}
 }
 
-func TestFromChatCompletionsSkipsNonFunctionTools(t *testing.T) {
-	out, eErr := BuildRequest("m", "openai", []byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","function":{"name":"f"}},{"type":"code_interpreter"}]}`), nil)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
+func TestFromChatCompletionsRejectsNonFunctionTools(t *testing.T) {
+	_, eErr := BuildRequest("m", "openai", []byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","function":{"name":"f"}},{"type":"code_interpreter"}]}`), nil)
+	if eErr == nil || eErr.Class != errclass.ClassUnsupported {
+		t.Fatalf("want ClassUnsupported, got %+v", eErr)
 	}
 	var m map[string]any
+	out, _ := BuildRequest("m", "openai", []byte(`{"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","name":"f","function":{"name":"f"}}]}`), nil)
 	if err := json.Unmarshal(out, &m); err != nil {
 		t.Fatalf("output is not JSON: %v", err)
 	}
@@ -337,12 +543,14 @@ func TestFromClaudeMessagesFull(t *testing.T) {
 				{"type":"redacted_thinking","data":"xx"},
 				{"type":"tool_use","id":"tu_1","name":"lookup","input":{"q":"x"}},
 				{"type":"tool_use","id":"tu_2","name":"lookup","input":null},
-				{"type":"tool_use","id":"tu_3","name":"lookup"}
+				{"type":"tool_use","id":"tu_3","name":"lookup"},
+				{"type":"tool_use","id":"tu_4","name":"lookup"}
 			]},
 			{"role":"user","content":[
 				{"type":"tool_result","tool_use_id":"tu_1","content":"ok"},
 				{"type":"tool_result","tool_use_id":"tu_2","content":[{"type":"text","text":"part"}]},
-				{"type":"tool_result","tool_use_id":"tu_3","content":"boom","is_error":true},
+				{"type":"tool_result","tool_use_id":"tu_3","content":[{"type":"tool_reference","tool_name":"web_search"}]},
+				{"type":"tool_result","tool_use_id":"tu_4","content":"boom","is_error":true},
 				{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AAAA"}}
 			]},
 			{"role":"user","content":[{"type":"text","text":"done"}]}
@@ -371,7 +579,7 @@ func TestFromClaudeMessagesFull(t *testing.T) {
 		t.Errorf("tool = %v", tl)
 	}
 	items := inputItems(t, m)
-	if len(items) != 10 {
+	if len(items) != 12 {
 		t.Fatalf("items = %d: %v", len(items), items)
 	}
 	if p := partMap(t, itemMap(t, items, 0), 0); p["type"] != "input_text" || p["text"] != "hello" {
@@ -385,32 +593,35 @@ func TestFromClaudeMessagesFull(t *testing.T) {
 		t.Errorf("assistant part = %v", p)
 	}
 	for i, want := range []struct{ id, args string }{
-		{"tu_1", `{"q":"x"}`}, {"tu_2", "{}"}, {"tu_3", "{}"},
+		{"tu_1", `{"q":"x"}`}, {"tu_2", "{}"}, {"tu_3", "{}"}, {"tu_4", "{}"},
 	} {
 		fc := itemMap(t, items, 2+i)
 		if fc["type"] != "function_call" || fc["call_id"] != want.id || fc["arguments"] != want.args {
 			t.Errorf("function_call %d = %v, want %+v", i, fc, want)
 		}
 	}
-	fco := itemMap(t, items, 5)
+	fco := itemMap(t, items, 6)
 	if fco["output"] != "ok" || fco["call_id"] != "tu_1" {
 		t.Errorf("tool output 0 = %v", fco)
 	}
-	if got := itemMap(t, items, 6)["output"]; got != "part" {
+	if got := itemMap(t, items, 7)["output"]; got != "part" {
 		t.Errorf("tool output 1 = %v, want text only", got)
 	}
-	if got := itemMap(t, items, 7)["output"]; got != "[error] boom" {
+	if got := itemMap(t, items, 8)["output"]; got != "[tool: web_search]" {
+		t.Errorf("tool output 2 = %v, want [tool: web_search]", got)
+	}
+	if got := itemMap(t, items, 9)["output"]; got != "[error] boom" {
 		t.Errorf("is_error marker = %v", got)
 	}
-	img := itemMap(t, items, 8)
+	img := itemMap(t, items, 10)
 	if img["role"] != "user" {
-		t.Fatalf("item8 = %v", img)
+		t.Fatalf("item10 = %v", img)
 	}
 	if p := partMap(t, img, 0); p["type"] != "input_image" || p["image_url"] != "data:image/png;base64,AAAA" {
 		t.Errorf("base64 image part = %v", p)
 	}
-	if p := partMap(t, itemMap(t, items, 9), 0); p["text"] != "done" {
-		t.Errorf("item9 = %v", p)
+	if p := partMap(t, itemMap(t, items, 11), 0); p["text"] != "done" {
+		t.Errorf("item11 = %v", p)
 	}
 }
 
@@ -511,27 +722,29 @@ func TestFromClaudeMessagesAbsentSystemAndNullContent(t *testing.T) {
 // naming the endpoint, exactly like every other translator leg — never
 // forwarded verbatim upstream.
 func TestClaudeUnknownRoleRejected(t *testing.T) {
-	// Mid-history system reminders fold into the instructions instead
-	// of failing (Claude Code 2.x emits them as role:"system").
-	out, eErr := BuildRequest("m", "claude", []byte(`{"max_tokens":10,"system":"base","messages":[`+
-		`{"role":"user","content":"hi"},{"role":"system","content":"mid-history"}]}`), nil)
-	if eErr != nil {
-		t.Fatalf("unexpected error: %v", eErr)
-	}
-	m := decodeReq(t, out)
-	if m["instructions"] != "base\n\nmid-history" {
-		t.Fatalf("instructions = %v", m["instructions"])
-	}
-	if items := inputItems(t, m); len(items) != 1 {
-		t.Fatalf("want 1 input item, got %v", items)
-	}
-
-	_, eErr = BuildRequest("m", "claude",
+	_, eErr := BuildRequest("m", "claude",
 		[]byte(`{"max_tokens":10,"messages":[{"role":"robot","content":"x"}]}`), nil)
 	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
 		eErr.Message != `unsupported message role "robot" for /v1/responses` {
 		t.Fatalf("garbage role = %+v", eErr)
 	}
+}
+
+// Red reproduction: in-history role:"system" turns must convert to Responses
+// format without error (system content appended to instructions or input).
+func TestInHistorySystemRoleInClaudeMessages(t *testing.T) {
+	body := []byte(`{"max_tokens":10,"system":"top","messages":[` +
+		`{"role":"user","content":"hi"},{"role":"system","content":"mid-history"}]}`)
+	m := decodeReq(t, mustBuild(t, "m", "claude", body, nil))
+	if instr, _ := m["instructions"].(string); strings.Contains(instr, "mid-history") {
+		return
+	}
+	for _, item := range inputItems(t, m) {
+		if strings.Contains(fmt.Sprintf("%v", item), "mid-history") {
+			return
+		}
+	}
+	t.Fatalf("in-history system content lost: %v", m)
 }
 
 // FR-005 drift fix (shared.ClaudeMaxTokens): an absent or non-positive
@@ -689,31 +902,30 @@ func TestFromChatCompletionsImageInToolContentRejected(t *testing.T) {
 	}
 }
 
-// reasoning_effort is capability-gated like the reverse Responses→CC leg:
-// unsupported levels fail descriptively, supported ones forward normalized.
+// reasoning_effort passes through normalized without local validation:
+// unlisted levels forward as-is; upstream is the sole authority.
 func TestFromChatCompletionsEffortCapability(t *testing.T) {
 	body := []byte(`{"messages":[],"reasoning_effort":" XHIGH "}`)
-	if _, eErr := BuildRequest("m", "openai", body, nil); eErr == nil || eErr.Class != errclass.ClassUnsupported {
-		t.Fatalf("unsupported effort = %v, want ClassUnsupported", eErr)
+	m := decodeReq(t, mustBuild(t, "m", "openai", body, nil))
+	if r := m["reasoning"].(map[string]any); r["effort"] != "xhigh" {
+		t.Fatalf("passthrough effort = %v, want xhigh", r)
 	}
 	ts := &pluginapi.ThinkingSupport{Levels: []string{"low", "high", "xhigh"}}
-	m := decodeReq(t, mustBuild(t, "m", "openai", body, ts))
+	m = decodeReq(t, mustBuild(t, "m", "openai", body, ts))
 	r := m["reasoning"].(map[string]any)
 	if r["effort"] != "xhigh" {
 		t.Fatalf("supported effort = %v, want xhigh", r)
 	}
 }
 
-// Sentinels are capability-gated: a "none" the model does not declare and
-// the dynamic "auto" sentinel are omitted — Responses has no off-switch, so
-// omission is the no-forced-reasoning policy (matches the Messages-target
-// leg); declared levels forward.
+// Only the dynamic "auto" sentinel omits reasoning; every other effort
+// (including "none") forwards normalized without local validation.
 func TestFromChatCompletionsEffortSentinelsOmitted(t *testing.T) {
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, DynamicAllowed: true}
 	m := decodeReq(t, mustBuild(t, "m", "openai",
 		[]byte(`{"messages":[],"reasoning_effort":"none"}`), ts))
-	if _, has := m["reasoning"]; has {
-		t.Fatalf("none must omit reasoning: %v", m["reasoning"])
+	if r, ok := m["reasoning"].(map[string]any); !ok || r["effort"] != "none" {
+		t.Fatalf("none must forward: %v", m["reasoning"])
 	}
 
 	m = decodeReq(t, mustBuild(t, "m", "openai",
@@ -735,6 +947,22 @@ func TestFromChatCompletionsEffortSentinelsOmitted(t *testing.T) {
 // leg which forwards the identical validated value as-is (FR-005
 // no-silent-loss). The undeclared case stays pinned by
 // TestFromChatCompletionsEffortSentinelsOmitted.
+func TestFromChatCompletions_ReasoningEffortPassthroughWithoutValidation(t *testing.T) {
+	body := []byte(`{"messages":[],"reasoning_effort":"xhigh"}`)
+	out, eErr := BuildRequest("gpt-5", "openai", []byte(body), nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil (passthrough xhigh)", eErr)
+	}
+	m := decodeReq(t, out)
+	r, ok := m["reasoning"].(map[string]any)
+	if !ok {
+		t.Fatalf("reasoning missing: %v", m)
+	}
+	if r["effort"] != "xhigh" {
+		t.Fatalf("reasoning.effort = %v, want xhigh", r["effort"])
+	}
+}
+
 func TestFromChatCompletionsEffortNoneDeclaredForwarded(t *testing.T) {
 	ts := &pluginapi.ThinkingSupport{ZeroAllowed: true, Levels: []string{"none", "low"}}
 	m := decodeReq(t, mustBuild(t, "m", "openai",

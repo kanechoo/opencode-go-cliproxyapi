@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/config"
 )
@@ -1031,21 +1031,24 @@ func TestReasoningControlsExplicit(t *testing.T) {
 	})
 }
 
-func TestResponsesSkipsNonFunctionTools(t *testing.T) {
+func TestResponsesRejectsNonFunctionTools(t *testing.T) {
 	m, _, _, _ := newIntegrationManager(t)
 	// Cross-format client (openai source) brings a non-function tool to the
-	// Responses route; the adapter skips client-side-only tool types so the
-	// request still translates (FR-005 omission policy).
+	// Responses route; the adapter rejects it descriptively instead of
+	// silently dropping it or emitting malformed output.
 	reqBody := `{"model":"opencode-go/gpt-5.6-luna",
 		"messages":[{"role":"user","content":"hi"}],
-		"tools":[{"type":"function","name":"get_weather","function":{"name":"get_weather"}},{"type":"web_search"}]}`
+		"tools":[{"type":"web_search"}]}`
 	resp, err := m.HandleCall("executor.execute", execReqBody("opencode-go/gpt-5.6-luna", "openai", []byte(reqBody), false))
 	if err != nil {
 		t.Fatalf("execute: %v", err)
 	}
 	env := decodeEnv(t, resp)
-	if !env.OK || env.Error != nil {
+	if env.OK || env.Error == nil || env.Error.Code != "unsupported_protocol_or_parameter" {
 		t.Fatalf("envelope = %s", resp)
+	}
+	if !strings.Contains(env.Error.Message, "web_search") || !strings.Contains(env.Error.Message, "/v1/responses") {
+		t.Fatalf("message not descriptive: %q", env.Error.Message)
 	}
 }
 

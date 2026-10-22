@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/errclass"
 )
 
@@ -791,49 +792,123 @@ func TestStreamResponsesTextAggregationMatchesNonStream(t *testing.T) {
 	}
 }
 
-// Regression pin: every announced Responses item must be closed with
-// response.output_item.done before response.completed — Responses clients
-// (notably codex) materialize assistant text and tool calls ONLY from
-// done payloads, so deltas alone leave the turn with usage but no agent
-// message.
-func TestStreamResponsesDoneLifecycle(t *testing.T) {
+func TestStreamResponses_ItemDoneEvents(t *testing.T) {
 	sc := NewStreamConverter("openai-response")
 	events, done, eErr := feed(t, sc,
-		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_d\",\"model\":\"m\",\"usage\":{\"input_tokens\":3}}}\n\n",
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":3}}}\n\n",
 		"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\"}}\n\n",
-		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"OK\"}}\n\n",
-		"event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"c9\",\"name\":\"f\"}}\n\n",
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+		"event: content_block_start\ndata: {\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"f\"}}\n\n",
 		"event: content_block_delta\ndata: {\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"a\\\":1}\"}}\n\n",
-		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n\n",
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":5}}\n\n",
+		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+	)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	if !done {
+		t.Fatal("done not reached")
+	}
+	var names []string
+	for _, e := range events {
+		s := string(e)
+		if !strings.HasPrefix(s, "event: ") {
+			continue
+		}
+		name, _, _ := strings.Cut(s, "\n")
+		names = append(names, strings.TrimPrefix(name, "event: "))
+	}
+	wantTail := []string{
+		"response.output_text.done",
+		"response.content_part.done",
+		"response.output_item.done",
+		"response.function_call_arguments.done",
+		"response.output_item.done",
+		"response.completed",
+	}
+	if len(names) < len(wantTail) {
+		t.Fatalf("event names = %v, want tail %v", names, wantTail)
+	}
+	gotTail := names[len(names)-len(wantTail):]
+	if !reflect.DeepEqual(gotTail, wantTail) {
+		t.Fatalf("done-event sequence = %v, want %v (full: %v)", gotTail, wantTail, names)
+	}
+	byName := namedEvents(t, events)
+	textDone := byName["response.output_text.done"]
+	if len(textDone) != 1 || textDone[0]["item_id"] != "msg_1" ||
+		textDone[0]["output_index"] != float64(0) || textDone[0]["text"] != "hello" {
+		t.Errorf("output_text.done = %v", textDone)
+	}
+	partDone := byName["response.content_part.done"]
+	if len(partDone) != 1 || partDone[0]["item_id"] != "msg_1" ||
+		partDone[0]["output_index"] != float64(0) {
+		t.Errorf("content_part.done = %v", partDone)
+	} else if part, _ := partDone[0]["part"].(map[string]any); part["text"] != "hello" {
+		t.Errorf("content_part.done part = %v", partDone[0])
+	}
+	itemDone := byName["response.output_item.done"]
+	if len(itemDone) != 2 {
+		t.Fatalf("output_item.done count = %d: %v", len(itemDone), itemDone)
+	}
+	if itemDone[0]["output_index"] != float64(0) ||
+		itemDone[0]["item"].(map[string]any)["type"] != "message" {
+		t.Errorf("message output_item.done = %v", itemDone[0])
+	}
+	argsDone := byName["response.function_call_arguments.done"]
+	if len(argsDone) != 1 || argsDone[0]["item_id"] != "call_1" ||
+		argsDone[0]["output_index"] != float64(1) || argsDone[0]["arguments"] != "{\"a\":1}" {
+		t.Errorf("function_call_arguments.done = %v", argsDone)
+	}
+	if itemDone[1]["output_index"] != float64(1) {
+		t.Errorf("function_call output_item.done output_index = %v", itemDone[1])
+	} else if call, _ := itemDone[1]["item"].(map[string]any); call["type"] != "function_call" ||
+		call["call_id"] != "call_1" || call["name"] != "f" || call["arguments"] != "{\"a\":1}" {
+		t.Errorf("function_call output_item.done = %v", itemDone[1])
+	}
+}
+
+func TestStreamResponsesNamespaceRestored(t *testing.T) {
+	rt := shared.NewResponseTools()
+	reqBody := `{"input":"hi","tools":[{"type":"namespace","name":"subagents","tools":[{"type":"function","name":"spawn_agent","parameters":{"type":"object"}}]}]}`
+	if _, eErr := BuildRequest("m", "openai-response", []byte(reqBody), nil, rt); eErr != nil {
+		t.Fatalf("BuildRequest: %v", eErr)
+	}
+	sc := NewStreamConverter("openai-response", rt)
+	events, done, eErr := feed(t, sc,
+		"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1}}}\n\n",
+		"event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"call_1\",\"name\":\"subagents__spawn_agent\"}}\n\n",
+		"event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n\n",
+		"event: message_delta\ndata: {\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":2}}\n\n",
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
 	)
 	if eErr != nil || !done {
 		t.Fatalf("done=%v err=%v", done, eErr)
 	}
-	var names []string
-	for _, raw := range events {
-		line, _, _ := strings.Cut(string(raw), "\n")
-		names = append(names, strings.TrimPrefix(line, "event: "))
-	}
-	want := []string{
-		"response.created", "response.in_progress",
-		"response.output_item.added", "response.content_part.added", "response.output_text.delta",
-		"response.output_item.added", "response.function_call_arguments.delta",
-		"response.output_text.done", "response.content_part.done", "response.output_item.done",
-		"response.function_call_arguments.done", "response.output_item.done",
-		"response.completed",
-	}
-	if strings.Join(names, ",") != strings.Join(want, ",") {
-		t.Fatalf("event sequence = %v, want %v", names, want)
-	}
 	byName := namedEvents(t, events)
-	msgDone := byName["response.output_item.done"][0]["item"].(map[string]any)
-	content, _ := json.Marshal(msgDone["content"])
-	if msgDone["type"] != "message" || !strings.Contains(string(content), "OK") {
-		t.Fatalf("message done must carry complete text: %v", msgDone)
+	added := byName["response.output_item.added"]
+	if len(added) != 1 {
+		t.Fatalf("output_item.added = %v", added)
 	}
-	fnDone := byName["response.output_item.done"][1]["item"].(map[string]any)
-	if fnDone["type"] != "function_call" || fnDone["call_id"] != "c9" || fnDone["arguments"] != `{"a":1}` {
-		t.Fatalf("function done must carry complete arguments: %v", fnDone)
+	if item := added[0]["item"].(map[string]any); item["name"] != "spawn_agent" || item["namespace"] != "subagents" {
+		t.Fatalf("ItemAdded identity not restored: %v", item)
+	}
+	argsDone := byName["response.function_call_arguments.done"]
+	if len(argsDone) != 1 || argsDone[0]["item_id"] != "call_1" || argsDone[0]["arguments"] != "{}" {
+		t.Fatalf("ArgsDone wrong: %v", argsDone)
+	}
+	itemDone := byName["response.output_item.done"]
+	if len(itemDone) != 1 {
+		t.Fatalf("output_item.done = %v", itemDone)
+	}
+	if item := itemDone[0]["item"].(map[string]any); item["name"] != "spawn_agent" || item["namespace"] != "subagents" {
+		t.Fatalf("ItemDone identity not restored: %v", itemDone[0])
+	}
+	completed := byName["response.completed"][0]["response"].(map[string]any)
+	output, ok := completed["output"].([]any)
+	if !ok || len(output) != 1 {
+		t.Fatalf("terminal output = %v", completed["output"])
+	}
+	if fc := output[0].(map[string]any); fc["name"] != "spawn_agent" || fc["namespace"] != "subagents" {
+		t.Fatalf("terminal identity not restored: %v", fc)
 	}
 }

@@ -6,7 +6,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
 )
 
 // Class is a stable error-category identifier (FR-009) used as the
@@ -107,11 +107,18 @@ func UpstreamFallback(msg string) *Error {
 // constructors already redact (so non-envelope consumers — logs, executor
 // fail paths reading .Message directly) are safe, and Redact is idempotent.
 func ToEnvelopeError(e *Error) pluginabi.Error {
+	status := e.StatusCode
+	if status == 0 {
+		switch e.Class {
+		case ClassUnsupported, ClassTranslation:
+			status = 400
+		}
+	}
 	return pluginabi.Error{
 		Code:       string(e.Class),
 		Message:    Redact(e.Message),
 		Retryable:  e.Retryable,
-		HTTPStatus: e.StatusCode,
+		HTTPStatus: status,
 	}
 }
 

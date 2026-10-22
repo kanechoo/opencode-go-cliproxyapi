@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/catalog"
 	"opencode-go-cliproxyapi/internal/config"
@@ -41,7 +41,7 @@ type fakeCaller struct {
 	mu        sync.Mutex
 	calls     []capturedCall
 	responder func(method string, payload []byte) ([]byte, error)
-	authFiles map[string]struct{}
+	authFiles map[string]string
 }
 
 func (f *fakeCaller) call(method string, payload []byte) ([]byte, error) {
@@ -63,9 +63,13 @@ func (f *fakeCaller) call(method string, payload []byte) ([]byte, error) {
 		if json.Unmarshal(payload, &req) == nil && strings.TrimSpace(req.Name) != "" {
 			f.mu.Lock()
 			if f.authFiles == nil {
-				f.authFiles = make(map[string]struct{})
+				f.authFiles = make(map[string]string)
 			}
-			f.authFiles[req.Name] = struct{}{}
+			var record struct {
+				ID string `json:"id"`
+			}
+			_ = json.Unmarshal(req.JSON, &record)
+			f.authFiles[req.Name] = record.ID
 			f.mu.Unlock()
 		}
 	}
@@ -93,9 +97,9 @@ func hasExplicitAuthList(raw []byte) bool {
 func (f *fakeCaller) authListResponse() []byte {
 	f.mu.Lock()
 	files := make([]pluginapi.HostAuthFileEntry, 0, len(f.authFiles))
-	for name := range f.authFiles {
+	for name, id := range f.authFiles {
 		files = append(files, pluginapi.HostAuthFileEntry{
-			ID: strings.TrimSuffix(name, ".json"), Name: name, Source: "file", Path: name,
+			ID: id, Name: name, Source: "file", Path: name,
 		})
 	}
 	f.mu.Unlock()
@@ -426,7 +430,7 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 		t.Fatalf("schema_version = %d, want %d", reg.SchemaVersion, pluginabi.SchemaVersion)
 	}
 	if reg.Metadata.Name != "opencode-go-cliproxyapi" || reg.Metadata.Version != pluginVersion ||
-		len(reg.Metadata.ConfigFields) != 0 {
+		len(reg.Metadata.ConfigFields) != 10 {
 		t.Fatalf("metadata wrong: %+v", reg.Metadata)
 	}
 	if !reg.Capabilities.ModelProvider || !reg.Capabilities.AuthProvider {
@@ -474,6 +478,51 @@ func TestRegisterSuccessPublishesModels(t *testing.T) {
 	}
 }
 
+func TestRegistrationConfigFields(t *testing.T) {
+	m, _ := newTestManager(catalogResponder(true, testCatalogJSON))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+
+	resp, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML))
+	if err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	var reg registrationResult
+	decodeResult(t, resp, &reg)
+
+	expectedFields := []struct {
+		name string
+		typ  pluginapi.ConfigFieldType
+	}{
+		{"api-keys", pluginapi.ConfigFieldTypeArray},
+		{"base-url", pluginapi.ConfigFieldTypeString},
+		{"catalog-url", pluginapi.ConfigFieldTypeString},
+		{"model-prefix", pluginapi.ConfigFieldTypeObject},
+		{"catalog", pluginapi.ConfigFieldTypeObject},
+		{"protocols", pluginapi.ConfigFieldTypeObject},
+		{"route-overrides", pluginapi.ConfigFieldTypeObject},
+		{"request-timeout", pluginapi.ConfigFieldTypeString},
+		{"max-response-bytes", pluginapi.ConfigFieldTypeInteger},
+		{"allow-http", pluginapi.ConfigFieldTypeBoolean},
+	}
+
+	if len(reg.Metadata.ConfigFields) != len(expectedFields) {
+		t.Fatalf("len(ConfigFields) = %d, want %d", len(reg.Metadata.ConfigFields), len(expectedFields))
+	}
+
+	for i, want := range expectedFields {
+		got := reg.Metadata.ConfigFields[i]
+		if got.Name != want.name {
+			t.Errorf("field[%d].Name = %q, want %q", i, got.Name, want.name)
+		}
+		if got.Type != want.typ {
+			t.Errorf("field[%d].Type = %q, want %q", i, got.Type, want.typ)
+		}
+		if got.Description == "" {
+			t.Errorf("field[%d].Description is empty", i)
+		}
+	}
+}
+
 func TestLifecycleMaterializesDeterministicAuthRecords(t *testing.T) {
 	first, second, third := "sk-materialize-a", "sk-materialize-b", "sk-materialize-c"
 	yamlText := "api-keys:\n  - value: " + first + "\n  - value: " + second + "\n"
@@ -507,7 +556,7 @@ func TestLifecycleMaterializesDeterministicAuthRecords(t *testing.T) {
 		}
 		hash := sha256.Sum256([]byte(record.APIKey))
 		wantHash := hex.EncodeToString(hash[:])
-		if record.Type != ProviderID || record.ID != "opencode-go-key-"+wantHash || record.Label != "OpenCode Go credential "+wantHash || wire.Name != record.ID+".json" {
+		if record.Type != ProviderID || record.ID != "opencode-go-key-"+wantHash || !strings.HasPrefix(record.Label, "OpenCode Go ") || !strings.HasPrefix(wire.Name, "OpenCode-Go-") {
 			t.Fatalf("record identity = %+v name=%q", record, wire.Name)
 		}
 		if record.APIKey == "" || strings.Contains(wire.Name, record.APIKey) || strings.Contains(record.ID, record.APIKey) {

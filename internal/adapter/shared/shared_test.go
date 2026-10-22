@@ -344,6 +344,27 @@ func TestUpstreamStatusError(t *testing.T) {
 	if e := UpstreamStatusError(503, []byte("down")); e.Message != "down" {
 		t.Fatalf("short body = %q", e.Message)
 	}
+
+	// JSON error bodies extract clean human-readable error messages.
+	cases := []struct {
+		body []byte
+		want string
+	}{
+		{[]byte(`{"error":{"message":"Invalid temperature: 999.0"}}`), "Invalid temperature: 999.0"},
+		{[]byte(`{"error":"model not found"}`), "model not found"},
+		{[]byte(`{"message":"unauthorized access"}`), "unauthorized access"},
+		{[]byte(`{"detail":"rate limit exceeded"}`), "rate limit exceeded"},
+		{[]byte(`{"error":{"message":"Bearer sk-secret-123 failed"}}`), "Bearer [redacted] failed"},
+		{[]byte(`{"error":{"type":"invalid_request"}}`), `{"error":{"type":"invalid_request"}}`},
+		{[]byte(`{"other":123}`), `{"other":123}`},
+		{[]byte(``), ""},
+	}
+	for _, tc := range cases {
+		e := UpstreamStatusError(400, tc.body)
+		if e.Message != tc.want {
+			t.Errorf("UpstreamStatusError(400, %s) = %q, want %q", tc.body, e.Message, tc.want)
+		}
+	}
 }
 
 func equalJSON(a, b any) bool {
@@ -439,12 +460,51 @@ func TestToolResultText(t *testing.T) {
 	if eErr != nil || got != "ab" {
 		t.Errorf("block array = %q, %v; want ab, nil", got, eErr)
 	}
+	gotRef, eErr := ToolResultText(json.RawMessage(`[{"type":"tool_reference","tool_name":"web_search"}]`), "n")
+	if eErr != nil || gotRef != "[tool: web_search]" {
+		t.Errorf("tool_reference block = %q, %v; want [tool: web_search], nil", gotRef, eErr)
+	}
 	if _, eErr := ToolResultText(json.RawMessage(`[{"type":"image","source":{}}]`), "tool messages carry text only"); eErr == nil ||
 		eErr.Class != errclass.ClassTranslation ||
 		eErr.Message != `unsupported tool_result block type "image"; tool messages carry text only` {
 		t.Errorf("non-text block err = %+v", eErr)
 	}
 	if _, eErr := ToolResultText(json.RawMessage(`42`), "n"); eErr == nil || eErr.Class != errclass.ClassTranslation {
+		t.Errorf("malformed content err = %+v", eErr)
+	}
+}
+
+func TestRespItemOutputArray(t *testing.T) {
+	data := []byte(`{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"file contents"}]}`)
+	var item RespItem
+	if err := json.Unmarshal(data, &item); err != nil {
+		t.Fatalf("unmarshal RespItem: %v", err)
+	}
+	text, eErr := RespOutputText(item.Output, "tool messages carry text only")
+	if eErr != nil || text != "file contents" {
+		t.Fatalf("RespOutputText: got %q, %v", text, eErr)
+	}
+}
+
+func TestRespOutputText(t *testing.T) {
+	for _, raw := range []json.RawMessage{nil, json.RawMessage(`null`)} {
+		if got, _ := RespOutputText(raw, "n"); got != "" {
+			t.Errorf("absent content = %q", got)
+		}
+	}
+	if got, _ := RespOutputText(json.RawMessage(`"plain"`), "n"); got != "plain" {
+		t.Errorf("string content = %q", got)
+	}
+	got, eErr := RespOutputText(json.RawMessage(`[{"type":"input_text","text":"a"},{"type":"output_text","text":"b"},{"type":"text","text":"c"}]`), "n")
+	if eErr != nil || got != "abc" {
+		t.Errorf("part array = %q, %v; want abc, nil", got, eErr)
+	}
+	if _, eErr := RespOutputText(json.RawMessage(`[{"type":"image","source":{}}]`), "tool messages carry text only"); eErr == nil ||
+		eErr.Class != errclass.ClassTranslation ||
+		eErr.Message != `unsupported tool output part type "image"; tool messages carry text only` {
+		t.Errorf("non-text part err = %+v", eErr)
+	}
+	if _, eErr := RespOutputText(json.RawMessage(`42`), "n"); eErr == nil || eErr.Class != errclass.ClassTranslation {
 		t.Errorf("malformed content err = %+v", eErr)
 	}
 }
@@ -928,6 +988,53 @@ func TestResponsesEventEmitter(t *testing.T) {
 	}
 }
 
+// FR-006: item lifecycle completion events render before
+// response.completed — TextDone/ContentPartDone close the message text,
+// ArgsDone closes the function call arguments (name only when non-empty),
+// and ItemDone closes each rendered output item.
+func TestResponsesEventEmitterDoneEvents(t *testing.T) {
+	e := ResponsesEventEmitter{ID: "r1", Model: "m1"}
+
+	td := ssePayload(t, e.TextDone("msg_1", 0, "hej"))
+	if td["type"] != "response.output_text.done" || td["item_id"] != "msg_1" ||
+		td["output_index"] != float64(0) || td["content_index"] != float64(0) || td["text"] != "hej" {
+		t.Fatalf("text done = %v", td)
+	}
+
+	cp := ssePayload(t, e.ContentPartDone("msg_1", 0, "hej"))
+	if cp["type"] != "response.content_part.done" || cp["item_id"] != "msg_1" ||
+		cp["output_index"] != float64(0) || cp["content_index"] != float64(0) {
+		t.Fatalf("content part done = %v", cp)
+	}
+	part, ok := cp["part"].(map[string]any)
+	if !ok || part["type"] != "output_text" || part["text"] != "hej" {
+		t.Fatalf("content part = %v", cp["part"])
+	}
+
+	ad := ssePayload(t, e.ArgsDone("c1", 1, "lookup", `{"q":1}`))
+	if ad["type"] != "response.function_call_arguments.done" || ad["item_id"] != "c1" ||
+		ad["output_index"] != float64(1) || ad["name"] != "lookup" || ad["arguments"] != `{"q":1}` {
+		t.Fatalf("args done = %v", ad)
+	}
+	// Empty name omits the member entirely.
+	ad = ssePayload(t, e.ArgsDone("c1", 1, "", `{}`))
+	if _, ok := ad["name"]; ok {
+		t.Fatalf("empty name must be omitted: %v", ad)
+	}
+	if ad["arguments"] != `{}` {
+		t.Fatalf("args done = %v", ad)
+	}
+
+	item := map[string]any{"type": "message", "id": "msg_1"}
+	id := ssePayload(t, e.ItemDone(0, item))
+	if id["type"] != "response.output_item.done" || id["output_index"] != float64(0) {
+		t.Fatalf("item done = %v", id)
+	}
+	if !reflect.DeepEqual(id["item"], map[string]any{"type": "message", "id": "msg_1"}) {
+		t.Fatalf("item done item = %v", id["item"])
+	}
+}
+
 // msgItem is the message item Render synthesizes for the given text.
 func msgItem(id, text string) RespItem {
 	content, _ := json.Marshal([]outputTextPart{{Type: "output_text", Text: text}})
@@ -1298,34 +1405,25 @@ func TestResponsesRequestDecodeHelpers(t *testing.T) {
 		t.Errorf("array input = %+v, %v", items, eErr)
 	}
 
-	var typeless ResponsesRequest
+	// Issue #1: Missing or empty type with a non-empty role infers "message".
+	var inferIn ResponsesRequest
 	if err := json.Unmarshal([]byte(
-		`{"input":[{"role":"user","content":[{"type":"input_text","text":"hi"}]}]}`), &typeless); err != nil {
+		`{"input":[{"role":"user","content":"say ok"},{"type":"","role":"assistant","content":"ok"}]}`), &inferIn); err != nil {
 		t.Fatal(err)
 	}
-	items, eErr = typeless.DecodeInputItems()
-	if eErr != nil || len(items) != 1 || items[0].Type != "message" || items[0].Role != "user" {
-		t.Errorf("typeless message input = %+v, %v", items, eErr)
+	items, eErr = inferIn.DecodeInputItems()
+	if eErr != nil || len(items) != 2 || items[0].Type != "message" || items[1].Type != "message" {
+		t.Errorf("inferred message type = %+v, %v", items, eErr)
 	}
 
-	var typelessAssistant ResponsesRequest
-	if err := json.Unmarshal([]byte(
-		`{"input":[{"role":"assistant","content":"done"}]}`), &typelessAssistant); err != nil {
+	// An item without role and without type remains untyped.
+	var untypedIn ResponsesRequest
+	if err := json.Unmarshal([]byte(`{"input":[{"type":"","role":"  "}]}`), &untypedIn); err != nil {
 		t.Fatal(err)
 	}
-	if items, eErr := typelessAssistant.DecodeInputItems(); eErr != nil || len(items) != 1 ||
-		items[0].Type != "message" || items[0].Role != "assistant" {
-		t.Errorf("typeless assistant input = %+v, %v", items, eErr)
-	}
-
-	var anonymous ResponsesRequest
-	if err := json.Unmarshal([]byte(
-		`{"input":[{"content":"hi"}]}`), &anonymous); err != nil {
-		t.Fatal(err)
-	}
-	if items, eErr := anonymous.DecodeInputItems(); eErr != nil || len(items) != 1 ||
-		items[0].Type != "" {
-		t.Errorf("roleless input = %+v, %v", items, eErr)
+	items, eErr = untypedIn.DecodeInputItems()
+	if eErr != nil || len(items) != 1 || items[0].Type != "" {
+		t.Errorf("untyped item = %+v, %v", items, eErr)
 	}
 
 	var badInstr ResponsesRequest

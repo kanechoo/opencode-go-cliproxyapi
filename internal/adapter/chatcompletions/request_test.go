@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"opencode-go-cliproxyapi/internal/adapter/shared"
 	"opencode-go-cliproxyapi/internal/errclass"
 )
@@ -601,6 +601,14 @@ func TestBuildRequestClaudeVariants(t *testing.T) {
 			t.Fatalf("block array result not flattened: %v", tool)
 		}
 	})
+	t.Run("tool_result tool_reference content", func(t *testing.T) {
+		m := mustBuild(t, "claude",
+			`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t9","content":[{"type":"tool_reference","tool_name":"web_search"}]}]}]}`, nil)
+		tool := m["messages"].([]any)[0].(map[string]any)
+		if tool["content"] != "[tool: web_search]" {
+			t.Fatalf("tool_reference block not serialized: %v", tool)
+		}
+	})
 	t.Run("tool_result is_error marker", func(t *testing.T) {
 		// is_error must survive as the "[error] " prefix like the
 		// Responses-route twin (responses/request.go), never silently lost.
@@ -686,6 +694,25 @@ func TestBuildRequestResponses(t *testing.T) {
 	tl := tools[0].(map[string]any)
 	if tl["type"] != "function" || tl["function"].(map[string]any)["name"] != "f" {
 		t.Fatalf("tool wrapping wrong: %v", tl)
+	}
+}
+
+func TestFromResponsesRequest_FunctionCallOutputArray(t *testing.T) {
+	body := `{
+		"model":"opencode-go/glm-5.2",
+		"input":[
+			{"type":"function_call","call_id":"c1","name":"read","arguments":"{}"},
+			{"type":"function_call_output","call_id":"c1","output":[{"type":"input_text","text":"file contents"}]}
+		]
+	}`
+	m := mustBuild(t, "openai-response", body, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages, got %d: %v", len(msgs), msgs)
+	}
+	outMsg := msgs[1].(map[string]any)
+	if outMsg["role"] != "tool" || outMsg["tool_call_id"] != "c1" || outMsg["content"] != "file contents" {
+		t.Fatalf("function_call_output wrong: %v", outMsg)
 	}
 }
 
@@ -806,31 +833,95 @@ func TestBuildRequestResponsesErrors(t *testing.T) {
 			}
 		})
 	}
-	// A non-function tool type is skipped: client-side-only tools (e.g.
-	// Codex "namespace" tools) have no upstream equivalent, so dropping
-	// them keeps the request alive (FR-005 omission policy). A request
-	// carrying only such tools translates with no tools attached.
-	m := mustBuild(t, "openai-response", `{"input":"hi","tools":[{"type":"web_search"}]}`, nil)
-	if _, ok := m["tools"]; ok {
-		t.Fatalf("non-function tools not skipped: %v", m["tools"])
+	// Hosted web search tools are dropped on the Chat Completions route
+	// (no function-calling equivalent); function tools proceed.
+	m := mustBuild(t, "openai-response",
+		`{"tools":[{"type":"web_search"},{"type":"web_search_preview"},{"type":"function","name":"f"}],"input":"hi"}`, nil)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("web_search not dropped: %v", m["tools"])
+	}
+	if tools[0].(map[string]any)["function"].(map[string]any)["name"] != "f" {
+		t.Fatalf("function tool lost: %v", m["tools"])
+	}
+}
+
+func TestFromResponses_NamespaceChildUnrolls(t *testing.T) {
+	body := `{
+		"input": "hi",
+		"tools": [
+			{"type": "namespace", "name": "subagents", "tools": [
+				{"type": "function", "name": "spawn_agent", "description": "d", "parameters": {"type": "object"}}
+			]}
+		]
+	}`
+	out, eErr := BuildRequest("m", "openai-response", []byte(body), nil, shared.NewResponseTools())
+	m := decodeOut(t, out, eErr)
+	tools, ok := m["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 flattened tool, got %+v", m["tools"])
+	}
+	fn := tools[0].(map[string]any)["function"].(map[string]any)
+	if fn["name"] != "subagents__spawn_agent" {
+		t.Fatalf("expected flattened subagents__spawn_agent, got %v", fn["name"])
+	}
+}
+
+func TestFromResponses_NamespacedToolChoiceFlattened(t *testing.T) {
+	body := `{
+		"input": "hi",
+		"tools": [
+			{"type": "namespace", "name": "subagents", "tools": [
+				{"type": "function", "name": "spawn_agent", "description": "d", "parameters": {"type": "object"}}
+			]}
+		],
+		"tool_choice": {"type": "function", "name": "spawn_agent", "namespace": "subagents"}
+	}`
+	out, eErr := BuildRequest("m", "openai-response", []byte(body), nil, shared.NewResponseTools())
+	m := decodeOut(t, out, eErr)
+	tc, ok := m["tool_choice"].(map[string]any)
+	if !ok || tc["type"] != "function" {
+		t.Fatalf("tool_choice wrong shape: %v", m["tool_choice"])
+	}
+	fn, ok := tc["function"].(map[string]any)
+	if !ok || fn["name"] != "subagents__spawn_agent" {
+		t.Fatalf("expected flattened subagents__spawn_agent, got %v", m["tool_choice"])
+	}
+}
+
+func TestFromResponses_NamespaceToolIgnored(t *testing.T) {
+	body := `{
+		"input": "hello",
+		"tools": [
+			{"type": "function", "name": "f1", "parameters": {"type": "object"}},
+			{"type": "namespace", "name": "subagents", "tools": []}
+		]
+	}`
+	out := mustBuild(t, "openai-response", body, nil)
+	tools, ok := out["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected 1 tool, got %+v", out["tools"])
+	}
+	toolMap := tools[0].(map[string]any)
+	fn := toolMap["function"].(map[string]any)
+	if fn["name"] != "f1" {
+		t.Fatalf("expected tool name f1, got %v", fn["name"])
 	}
 }
 
 func TestResponsesReasoningEffortValidated(t *testing.T) {
-	// ts nil → default levels {low,medium,high}: unsupported value rejected
-	// naming it; a supported level forwards verbatim.
-	_, eErr := BuildRequest("m", "openai-response",
-		[]byte(`{"reasoning":{"effort":"xhigh"},"input":"hi"}`), nil)
-	if eErr == nil || eErr.Class != errclass.ClassUnsupported ||
-		!strings.Contains(eErr.Message, `"xhigh"`) {
-		t.Fatalf("unsupported effort err = %+v", eErr)
+	// Transparent router: unlisted efforts pass through without local
+	// validation; upstream is the sole authority.
+	out := mustBuild(t, "openai-response", `{"reasoning":{"effort":"xhigh"},"input":"hi"}`, nil)
+	if out["reasoning_effort"] != "xhigh" {
+		t.Fatalf("passthrough effort = %v, want xhigh", out["reasoning_effort"])
 	}
-	out := mustBuild(t, "openai-response", `{"reasoning":{"effort":"high"},"input":"hi"}`, nil)
+	out = mustBuild(t, "openai-response", `{"reasoning":{"effort":"high"},"input":"hi"}`, nil)
 	if out["reasoning_effort"] != "high" {
 		t.Fatalf("supported effort = %v", out["reasoning_effort"])
 	}
 
-	// ts declaring xhigh admits it.
+	// Normalization still applies regardless of declared capability.
 	ts := &pluginapi.ThinkingSupport{Levels: []string{"low", "medium", "high", "xhigh"}}
 	out = mustBuild(t, "openai-response", `{"reasoning":{"effort":"XHigh"},"input":"hi"}`, ts)
 	if out["reasoning_effort"] != "xhigh" {
@@ -965,6 +1056,212 @@ func TestMalformedToolChoiceRejected(t *testing.T) {
 		_, eErr := BuildRequest("m", format, []byte(body), nil)
 		if eErr == nil || !strings.Contains(eErr.Message, "malformed tool_choice") {
 			t.Fatalf("%s: err = %+v", format, eErr)
+		}
+	}
+}
+
+func TestBuildOpenAIRequestDeveloperRole(t *testing.T) {
+	body := `{"model":"deepseek-v4.1-flash","messages":[{"role":"developer","content":"system instructions"},{"role":"user","content":"hi"}]}`
+	out, eErr := BuildRequest("deepseek-v4.1-flash", "openai", []byte(body), nil)
+	m := decodeOut(t, out, eErr)
+	msgs, ok := m["messages"].([]any)
+	if !ok || len(msgs) < 1 {
+		t.Fatalf("invalid messages: %v", m["messages"])
+	}
+	first, ok := msgs[0].(map[string]any)
+	if !ok {
+		t.Fatalf("invalid message format: %v", msgs[0])
+	}
+	if got := first["role"]; got != "system" {
+		t.Fatalf("expected role %q, got %q", "system", got)
+	}
+}
+
+func TestInHistorySystemRoleInMessages(t *testing.T) {
+	m := mustBuild(t, "claude", `{"messages":[{"role":"system","content":"sys-inturn"},{"role":"user","content":"hi"}]}`, nil)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("want 2 messages, got %d: %v", len(msgs), msgs)
+	}
+	sys := msgs[0].(map[string]any)
+	if sys["role"] != "system" || sys["content"] != "sys-inturn" {
+		t.Fatalf("in-history system message wrong: %v", sys)
+	}
+}
+
+func TestFromResponses_CustomToolCallAndOutput(t *testing.T) {
+	body := `{
+		"input": [
+			{"type": "message", "role": "user", "content": "run script"},
+			{"type": "custom_tool_call", "call_id": "call_c1", "name": "exec", "input": "text('ok');"},
+			{"type": "custom_tool_call_output", "call_id": "call_c1", "output": [{"type": "input_text", "text": "ok"}]}
+		]
+	}`
+	out, eErr := BuildRequest("gpt-4o", "openai-response", []byte(body), nil)
+	if eErr != nil {
+		t.Fatalf("unexpected error: %v", eErr)
+	}
+	m := decodeOut(t, out, eErr)
+	msgs := m["messages"].([]any)
+	if len(msgs) != 3 {
+		t.Fatalf("want 3 messages, got %d: %v", len(msgs), msgs)
+	}
+	if msgs[0].(map[string]any)["role"] != "user" || msgs[0].(map[string]any)["content"] != "run script" {
+		t.Fatalf("message 0 wrong: %v", msgs[0])
+	}
+	asst := msgs[1].(map[string]any)
+	if asst["role"] != "assistant" {
+		t.Fatalf("message 1 role = %v, want assistant", asst["role"])
+	}
+	calls := asst["tool_calls"].([]any)
+	c0 := calls[0].(map[string]any)
+	if c0["id"] != "call_c1" {
+		t.Fatalf("tool call id = %v, want call_c1", c0["id"])
+	}
+	fn := c0["function"].(map[string]any)
+	if fn["name"] != "exec" || fn["arguments"] != "text('ok');" {
+		t.Fatalf("tool call function wrong: %v", fn)
+	}
+	tool := msgs[2].(map[string]any)
+	if tool["role"] != "tool" || tool["tool_call_id"] != "call_c1" || tool["content"] != "ok" {
+		t.Fatalf("tool message wrong: %v", tool)
+	}
+}
+
+func TestResponsesReasoningEffortPassthroughWithoutValidation(t *testing.T) {
+	body := `{"reasoning":{"effort":"xhigh"},"input":"hi"}`
+	out, eErr := BuildRequest("gpt-4o", "openai-response", []byte(body), nil)
+	if eErr != nil {
+		t.Fatalf("BuildRequest err = %+v, want nil (passthrough xhigh)", eErr)
+	}
+	m := decodeOut(t, out, nil)
+	if m["reasoning_effort"] != "xhigh" {
+		t.Fatalf("reasoning_effort = %v, want xhigh", m["reasoning_effort"])
+	}
+}
+
+func TestClaudeToolImagesPreserveParallelResults(t *testing.T) {
+	body := `{
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "tool_use",
+          "id": "a",
+          "name": "Read",
+          "input": {}
+        },
+        {
+          "type": "tool_use",
+          "id": "b",
+          "name": "Read",
+          "input": {}
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "tool_result",
+          "tool_use_id": "a",
+          "content": [
+            {
+              "type": "text",
+              "text": "caption"
+            },
+            {
+              "type": "tool_reference",
+              "tool_name": "web_search"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": "QUJD"
+              }
+            }
+          ]
+        },
+        {
+          "type": "tool_result",
+          "tool_use_id": "b",
+          "is_error": true,
+          "content": [
+            {
+              "type": "tool_reference"
+            },
+            {
+              "type": "image",
+              "source": {
+                "type": "url",
+                "url": "https://example.com/b.png"
+              }
+            }
+          ]
+        },
+        {
+          "type": "text",
+          "text": "compare"
+        }
+      ]
+    }
+  ]
+}`
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%t", stream), func(t *testing.T) {
+			request := strings.Replace(body, `"messages":`, fmt.Sprintf(`"stream":%t,"messages":`, stream), 1)
+			out := mustBuild(t, "claude", request, nil)
+			msgs := out["messages"].([]any)
+			if len(msgs) != 4 {
+				t.Fatalf("messages: %v", msgs)
+			}
+			for i, id := range []string{"a", "b"} {
+				m := msgs[i+1].(map[string]any)
+				if m["role"] != "tool" || m["tool_call_id"] != id {
+					t.Fatalf("tool replies must precede user images: %v", msgs)
+				}
+			}
+			if !strings.Contains(msgs[1].(map[string]any)["content"].(string), "caption") {
+				t.Fatal("lost caption")
+			}
+			if !strings.Contains(msgs[1].(map[string]any)["content"].(string), "[tool: web_search]") ||
+				!strings.Contains(msgs[2].(map[string]any)["content"].(string), "[tool reference]") {
+				t.Fatal("lost upstream tool_reference markers")
+			}
+
+			if !strings.HasPrefix(msgs[2].(map[string]any)["content"].(string), shared.ToolResultErrorPrefix) {
+				t.Fatal("lost is_error")
+			}
+			user := msgs[3].(map[string]any)
+			if user["role"] != "user" {
+				t.Fatal("images require user role")
+			}
+			parts := user["content"].([]any)
+			var urls []string
+			for _, p := range parts {
+				v := p.(map[string]any)
+				if v["type"] == "image_url" {
+					urls = append(urls, v["image_url"].(map[string]any)["url"].(string))
+				}
+			}
+			if len(urls) != 2 || urls[0] != "data:image/png;base64,QUJD" || urls[1] != "https://example.com/b.png" {
+				t.Fatalf("lost images: %v", urls)
+			}
+			if got, _ := out["stream"].(bool); got != stream {
+				t.Fatalf("stream flag changed: %v", out["stream"])
+			}
+		})
+	}
+}
+
+func TestClaudeToolImagesRejectMalformedSource(t *testing.T) {
+	for _, source := range []string{`null`, `{"type":"base64"}`, `{"type":"url"}`, `{"type":"s3"}`} {
+		body := `{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"a","content":[{"type":"image","source":` + source + `}]}]}]}`
+		if _, err := BuildRequest("m", "claude", []byte(body), nil); err == nil {
+			t.Fatalf("accepted malformed image: %s", source)
 		}
 	}
 }
